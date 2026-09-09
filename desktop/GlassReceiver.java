@@ -81,8 +81,10 @@ public final class GlassReceiver {
         Rectangle region;
         double armSeconds = 10;
         Path outDir = Paths.get(".");
-        boolean noKeys, stats, verbose, selfTest, once;
+        boolean noKeys, stats, verbose, selfTest, once, vector;
         int drop;                                   // testing: ignore every Nth chunk the first time it is seen
+        int corrupt;                                // testing: flip this many cells before decoding an image
+        String mode = "raster";
         String decodeImage, captureOnce, dumpFail;
     }
 
@@ -90,6 +92,7 @@ public final class GlassReceiver {
         System.out.println(String.join("\n",
             "GlassTransfer receiver (Java 25, no dependencies)",
             "  java GlassReceiver.java [options]",
+            "    --mode raster|qr      which carrier to read; raster is the colour code and the default",
             "    --region x,y,w,h      screen area to watch (logical px); default: drag a rectangle on screen",
             "    --arm-seconds N       seconds of continuous QR detection before the transfer starts (10)",
             "    --out-dir DIR         where received files are written (current directory)",
@@ -99,6 +102,7 @@ public final class GlassReceiver {
             "    --verbose             log every decoded frame",
             "    --dump-fail DIR       save frames that fail to decode during a transfer (max 20)",
             "    --drop N              testing: ignore every Nth chunk once, to exercise the refetch",
+            "    --corrupt N           testing: with --decode-image, damage N cells before decoding",
             "    --capture-once f.png  save one capture of the region and exit",
             "    --decode-image f.png  decode a screenshot and print the frame header",
             "    --selftest            run offline decoder/protocol checks"));
@@ -121,10 +125,16 @@ public final class GlassReceiver {
                 case "--stats" -> c.stats = true;
                 case "--verbose" -> c.verbose = true;
                 case "--selftest" -> c.selfTest = true;
+                case "--vector" -> c.vector = true;
                 case "--decode-image" -> c.decodeImage = args[++i];
                 case "--capture-once" -> c.captureOnce = args[++i];
                 case "--dump-fail" -> c.dumpFail = args[++i];
                 case "--drop" -> c.drop = Integer.parseInt(args[++i]);
+                case "--corrupt" -> c.corrupt = Integer.parseInt(args[++i]);
+                case "--mode" -> {
+                    c.mode = args[++i].toLowerCase();
+                    if (!c.mode.equals("raster") && !c.mode.equals("qr")) throw new IllegalArgumentException("mode must be raster or qr");
+                }
                 case "-h", "--help" -> { usage(); System.exit(0); }
                 default -> throw new IllegalArgumentException("unknown option " + a);
             }
@@ -142,6 +152,7 @@ public final class GlassReceiver {
             System.exit(2);
             return;
         }
+        if (cfg.vector) { printVectors(); return; }
         if (cfg.selfTest) { System.exit(SelfTest.run() ? 0 : 1); return; }
         if (cfg.decodeImage != null) {
             System.setProperty("java.awt.headless", "true");
@@ -174,28 +185,60 @@ public final class GlassReceiver {
         }
         Border border = Border.create(region);
         Keys keys = new Keys(robot, !cfg.noKeys);
-        new Transfer(cfg, cap, keys, border).run();
+        new Transfer(cfg, cap, keys, border, carrierFor(cfg)).run();
+    }
+
+    /** Reference values for checking that another implementation agrees byte for byte. */
+    static void printVectors() {
+        int[] small = {1, 2, 3, 4, 5, 6};
+        System.out.println("rs(1..6, nsym=4)   = " + Transfer.hex(bytesOf(RS.encode(small, 4))));
+        int[] mid = new int[20];
+        for (int i = 0; i < mid.length; i++) mid[i] = (i * 37 + 11) & 0xFF;
+        System.out.println("rs(seq20, nsym=19) = " + Transfer.hex(bytesOf(RS.encode(mid, 19))));
+        int cols = 477, rows = 398;
+        Raster.Layout L = Raster.layout(cols, rows);
+        System.out.printf("layout %dx%d: blocks %d blockTotal %d ecc %d dataLen %d bodyLen %d capacity %d%n",
+            cols, rows, L.blocks(), L.blockTotal(), L.ecc(), L.dataLen(), L.bodyLen(), Raster.frameCapacity(cols, rows));
+        byte[] frame = new byte[Raster.frameCapacity(cols, rows)];
+        for (int i = 0; i < frame.length; i++) frame[i] = (byte) ((i * 37 + 11) & 0xFF);
+        byte[] cells = Raster.encode(frame, cols, rows);
+        java.util.zip.CRC32 c = new java.util.zip.CRC32();
+        c.update(cells, 0, cells.length);
+        System.out.printf("cells: %d, crc32 %08x%n", cells.length, (int) c.getValue());
+    }
+
+    static byte[] bytesOf(int[] v) {
+        byte[] b = new byte[v.length];
+        for (int i = 0; i < v.length; i++) b[i] = (byte) v[i];
+        return b;
+    }
+
+    static Carrier carrierFor(Config cfg) {
+        return cfg.mode.equals("qr") ? new QrCarrier() : new Raster();
     }
 
     static boolean decodeImageFile(Config cfg) throws IOException {
         BufferedImage bi = ImageIO.read(new File(cfg.decodeImage));
         if (bi == null) { System.err.println("Cannot read image " + cfg.decodeImage); return false; }
-        Gray g = Capture.toGray(bi);
-        QrDecoder dec = new QrDecoder();
+        Raster.DEBUG = cfg.verbose;
+        Img img = Capture.toImg(bi);
+        if (cfg.corrupt > 0) damage(img, cfg.corrupt);
+        Carrier carrier = carrierFor(cfg);
         long t0 = System.nanoTime();
-        QrDecoder.Result r = dec.process(g);
+        Carrier.Out r = carrier.read(img);
         long t1 = System.nanoTime();
-        System.out.printf("image %dx%d  result %s  (%.1f ms)%n", g.w(), g.h(), r.kind(), (t1 - t0) / 1e6);
-        if (dec.geo != null) {
-            QrDecoder.Geometry ge = dec.geo;
-            System.out.printf("geometry: size %d (version %d) pitch %.3f x %.3f origin %.1f,%.1f threshold %d%n",
-                ge.size(), (ge.size() - 17) / 4, ge.px(), ge.py(), ge.ox(), ge.oy(), dec.thr);
+        System.out.printf("image %dx%d  carrier %s  result %s  (%.1f ms)%n", img.w(), img.h(), carrier.name(), r.kind(), (t1 - t0) / 1e6);
+        if (r.bounds() != null) System.out.println("located at " + r.bounds().x + "," + r.bounds().y
+            + " " + r.bounds().width + "x" + r.bounds().height + " device px");
+        if (r.kind() != Kind.OK) return false;
+        System.out.println("decoded: " + r.info() + ", " + r.bytes().length + " bytes");
+        if (carrier instanceof Raster) {
+            int e = Raster.checkEcc(img);
+            System.out.println("error correction bytes: " + (e == 0 ? "agree with the data as captured"
+                : e > 0 ? ("repaired " + e + " byte(s), so the capture is noisy but the parity is sound")
+                : "cannot be reconciled with the data"));
         }
-        if (r.kind() != QrDecoder.Kind.OK) return false;
-        QrDecoder.Decoded d = r.decoded();
-        System.out.printf("decoded: version %d ecl %s mask %d corrected %d bytes %d%n",
-            d.version(), "LMQH".charAt(d.ecl()), d.mask(), d.corrected(), d.bytes().length);
-        Protocol.Frame f = Protocol.parse(d.bytes());
+        Protocol.Frame f = Protocol.parse(r.bytes());
         if (f == null) { System.out.println("not a GlassTransfer frame"); return true; }
         System.out.println("frame: " + f);
         if (f.type() == Protocol.END) {
@@ -209,18 +252,80 @@ public final class GlassReceiver {
         return true;
     }
 
+    /** Testing aid: overwrite n small square patches, as if cells had been misread. */
+    static void damage(Img img, int n) {
+        java.util.Random rnd = new java.util.Random(7);
+        for (int i = 0; i < n; i++) {
+            int x = 8 + rnd.nextInt(Math.max(1, img.w() - 16)), y = 8 + rnd.nextInt(Math.max(1, img.h() - 16));
+            int colour = Raster.colourOf(rnd.nextInt(Raster.SYMS));
+            for (int dy = 0; dy < 2; dy++) for (int dx = 0; dx < 2; dx++) img.px()[(y + dy) * img.w() + x + dx] = colour;
+        }
+        System.out.println("damaged " + n + " spots before decoding");
+    }
+
     // =========================================================================================
     // Screens, capture
     // =========================================================================================
 
+    /** A captured region: packed 0xRRGGBB pixels (alpha ignored), row major. */
+    record Img(int[] px, int w, int h) {
+        int at(int x, int y) { return px[y * w + x]; }
+
+        BufferedImage toImage() {
+            BufferedImage bi = new BufferedImage(w, h, BufferedImage.TYPE_INT_RGB);
+            bi.setRGB(0, 0, w, h, px, 0, w);
+            return bi;
+        }
+    }
+
     record Gray(byte[] px, int w, int h) {
         int at(int x, int y) { return px[y * w + x] & 0xFF; }
+
+        static Gray of(Img img) {
+            byte[] out = new byte[img.w() * img.h()];
+            int[] p = img.px();
+            for (int i = 0; i < out.length; i++) out[i] = (byte) ((p[i] >>> 8) & 0xFF);   // green channel
+            return new Gray(out, img.w(), img.h());
+        }
 
         BufferedImage toImage() {
             BufferedImage bi = new BufferedImage(w, h, BufferedImage.TYPE_BYTE_GRAY);
             bi.getRaster().setDataElements(0, 0, w, h, px);
             return bi;
         }
+    }
+
+    enum Kind { NONE, FAIL, OK }
+
+    /** Whatever the receiver reads off the screen: a colour raster, or a QR symbol. */
+    interface Carrier {
+        record Out(Kind kind, boolean changed, byte[] bytes, String info, Rectangle bounds) { }
+
+        Out read(Img img);
+        void forget();
+        String name();
+    }
+
+    /** Adapts the QR decoder to the carrier interface, so either can drive a transfer. */
+    static final class QrCarrier implements Carrier {
+        final QrDecoder dec = new QrDecoder();
+
+        @Override public Out read(Img img) {
+            QrDecoder.Result r = dec.process(Gray.of(img));
+            Rectangle b = null;
+            QrDecoder.Geometry g = dec.geo;
+            if (g != null)
+                b = new Rectangle((int) (g.ox() - 3 * g.px()), (int) (g.oy() - 3 * g.py()),
+                                  (int) ((g.size() + 6) * g.px()), (int) ((g.size() + 6) * g.py()));
+            if (r.kind() != Kind.OK) return new Out(r.kind(), r.changed(), null, "", b);
+            QrDecoder.Decoded d = r.decoded();
+            return new Out(Kind.OK, r.changed(), d.bytes(),
+                String.format("QR v%d %c mask %d, repaired %d", d.version(), "LMQH".charAt(d.ecl()), d.mask(), d.corrected()), b);
+        }
+
+        @Override public void forget() { dec.geo = null; }
+
+        @Override public String name() { return "qr"; }
     }
 
     static final class Screens {
@@ -258,13 +363,13 @@ public final class GlassReceiver {
         Capture(Robot robot, Rectangle region) { this.robot = robot; this.full = region; this.region = region; }
 
         /** Shrinks the grabbed area to the located code plus a margin. BitBlt cost scales with area. */
-        void tighten(QrDecoder.Geometry geo) {
-            if (region != full) return;
-            double m = 6 * Math.max(geo.px(), geo.py());
-            int x0 = (int) Math.floor((geo.ox() - 3 * geo.px() - m) / scale);
-            int y0 = (int) Math.floor((geo.oy() - 3 * geo.py() - m) / scale);
-            int x1 = (int) Math.ceil((geo.ox() + (geo.size() + 3) * geo.px() + m) / scale);
-            int y1 = (int) Math.ceil((geo.oy() + (geo.size() + 3) * geo.py() + m) / scale);
+        void tighten(Rectangle b) {
+            if (region != full || b == null) return;
+            int m = Math.max(12, Math.min(b.width, b.height) / 16);
+            int x0 = (int) Math.floor((b.x - m) / scale);
+            int y0 = (int) Math.floor((b.y - m) / scale);
+            int x1 = (int) Math.ceil((b.x + b.width + m) / scale);
+            int y1 = (int) Math.ceil((b.y + b.height + m) / scale);
             Rectangle r = new Rectangle(full.x + x0, full.y + y0, x1 - x0, y1 - y0).intersection(full);
             if (r.width < 40 || r.height < 40 || (long) r.width * r.height >= (long) full.width * full.height) return;
             region = r;
@@ -293,28 +398,23 @@ public final class GlassReceiver {
             return bi;
         }
 
-        Gray grab() { return toGray(grabImage()); }
+        Img grab() { return toImg(grabImage()); }
 
-        static Gray toGray(BufferedImage bi) {
+        static Img toImg(BufferedImage bi) {
             int w = bi.getWidth(), h = bi.getHeight();
-            byte[] out = new byte[w * h];
-            int[] px = null;
-            int stride = w, off = 0;
             int t = bi.getType();
             if ((t == BufferedImage.TYPE_INT_RGB || t == BufferedImage.TYPE_INT_ARGB || t == BufferedImage.TYPE_INT_ARGB_PRE)
                 && bi.getRaster().getDataBuffer() instanceof DataBufferInt db
                 && bi.getRaster().getSampleModel() instanceof SinglePixelPackedSampleModel sm
                 && bi.getRaster().getSampleModelTranslateX() == 0 && bi.getRaster().getSampleModelTranslateY() == 0) {
-                px = db.getData();
-                stride = sm.getScanlineStride();
-                off = db.getOffset();
+                int[] data = db.getData();
+                int stride = sm.getScanlineStride(), off = db.getOffset();
+                if (stride == w && off == 0 && data.length == w * h) return new Img(data, w, h);
+                int[] out = new int[w * h];
+                for (int y = 0; y < h; y++) System.arraycopy(data, off + y * stride, out, y * w, w);
+                return new Img(out, w, h);
             }
-            if (px == null) px = bi.getRGB(0, 0, w, h, null, 0, w);
-            for (int y = 0; y < h; y++) {
-                int s = off + y * stride, d = y * w;
-                for (int x = 0; x < w; x++) out[d + x] = (byte) ((px[s + x] >>> 8) & 0xFF);   // green channel
-            }
-            return new Gray(out, w, h);
+            return new Img(bi.getRGB(0, 0, w, h, null, 0, w), w, h);
         }
     }
 
@@ -528,8 +628,8 @@ public final class GlassReceiver {
     // =========================================================================================
 
     static final class Protocol {
-        static final int PROTO = 2;                 // bumped when the frame layout changes
-        static final int HEADER = 21, DATA = 0, END = 1;
+        static final int PROTO = 3;                 // bumped when the frame layout changes
+        static final int HEADER = 23, DATA = 0, END = 1;
         static final int END_FIXED = 8 + 4 + 32 + 2;   // size, crc32, sha256, name length
 
         record Frame(int type, int fileId, int index, int total, int chunkSize, byte[] payload) {
@@ -548,14 +648,15 @@ public final class GlassReceiver {
             if (type > END) return null;
             ByteBuffer bb = ByteBuffer.wrap(b);
             int fileId = bb.getInt(3), index = bb.getInt(7), total = bb.getInt(11);
-            int chunk = bb.getShort(15) & 0xFFFF, crc = bb.getInt(17);
+            int chunk = bb.getInt(15), crc = bb.getInt(19);
             CRC32 c = new CRC32();
-            c.update(b, 0, 17);
+            c.update(b, 0, 19);
             c.update(new byte[4], 0, 4);
             c.update(b, HEADER, b.length - HEADER);
             if ((int) c.getValue() != crc) return null;
             if (index < 0 || total < 0) return null;
-            if (type == DATA && (index >= total || chunk == 0 || b.length == HEADER)) return null;
+            if (chunk <= 0) return null;
+            if (type == DATA && (index >= total || b.length == HEADER)) return null;
             if (type == END && index != total) return null;
             return new Frame(type, fileId, index, total, chunk, Arrays.copyOfRange(b, HEADER, b.length));
         }
@@ -577,11 +678,11 @@ public final class GlassReceiver {
             byte[] b = new byte[HEADER + payload.length];
             b[0] = 'G'; b[1] = 'T'; b[2] = (byte) ((PROTO << 4) | type);
             ByteBuffer bb = ByteBuffer.wrap(b);
-            bb.putInt(3, fileId); bb.putInt(7, index); bb.putInt(11, total); bb.putShort(15, (short) chunkSize); bb.putInt(17, 0);
+            bb.putInt(3, fileId); bb.putInt(7, index); bb.putInt(11, total); bb.putInt(15, chunkSize); bb.putInt(19, 0);
             System.arraycopy(payload, 0, b, HEADER, payload.length);
             CRC32 c = new CRC32();
             c.update(b, 0, b.length);
-            bb.putInt(17, (int) c.getValue());
+            bb.putInt(19, (int) c.getValue());
             return b;
         }
     }
@@ -626,7 +727,6 @@ public final class GlassReceiver {
         record Finder(double cx, double cy, double module, int n) { }
         record Geometry(double ox, double oy, double px, double py, int size, Finder tl, Finder tr, Finder bl) { }
         record Decoded(int version, int ecl, int mask, byte[] bytes, int corrected) { }
-        enum Kind { NONE, FAIL, OK }
         record Result(Kind kind, boolean changed, Decoded decoded) { }
 
         static final Result NONE = new Result(Kind.NONE, true, null);
@@ -1234,6 +1334,488 @@ public final class GlassReceiver {
     }
 
     // =========================================================================================
+    // Colour raster: the carrier that replaces QR for screen-to-screen transfer
+    //
+    // The channel is a lossless, axis-aligned screen grab, so none of a camera code's defences
+    // are needed. Each cell is one of five colours -- black, red, green, blue, white -- drawn at a
+    // few device pixels square. Five is not a power of two, so two bytes ride in seven cells as a
+    // base-5 number: 2.29 bits a cell against the 2.32 the alphabet allows. Five colours rather
+    // than eight because they survive anything: a cell is read by which channel dominates, not by
+    // matching a shade, so a dimmed, washed out or colour managed display still decodes.
+    //
+    // A grey rim locates the grid (grey never occurs in the payload) and a calibration row carries
+    // all five colours so the decoder measures the display rather than assuming it. Reed-Solomon
+    // repairs isolated cell errors; the frame CRC decides correctness, so on a clean capture the
+    // error correction costs nothing at all.
+    //
+    //   quiet zone (white, 4 cells)
+    //   +--------------------------------------+
+    //   | rim (grey, 2 cells)                  |
+    //   |  +--------------------------------+  |
+    //   |  | calibration row: 5 colours ...  | |
+    //   |  | data cells, row major ...       | |
+    //   |  +--------------------------------+  |
+    //   +--------------------------------------+
+    // =========================================================================================
+
+    static final class Raster implements Carrier {
+        static final int QUIET = 4, RIM = 2, CAL_ROWS = 1;
+        static final int RS_BLOCK = 255, RS_ECC = 20, RS_DATA = RS_BLOCK - RS_ECC;
+        static final int GREY = 0x808080, GREY_TOL = 32;
+        /** Black, red, green, blue, white. Two bytes ride in seven cells as a base-5 number. */
+        static final int BLACK = 0, RED = 1, GREEN = 2, BLUE = 3, WHITE = 4;
+        static final int SYMS = 5, GROUP = 7, GROUP_BYTES = 2;
+        static final int[] PALETTE = {0x000000, 0xFF0000, 0x00FF00, 0x0000FF, 0xFFFFFF};
+        static boolean DEBUG;
+
+        static void say(String s) { if (DEBUG) log("  raster: " + s); }
+
+        static int colourOf(int sym) { return PALETTE[sym]; }
+
+        record Geom(int x0, int y0, int cellPx, int cols, int rows) {
+            int width() { return cols * cellPx; }
+            int height() { return rows * cellPx; }
+        }
+
+        // ---- capacity arithmetic, identical on both sides -------------------------------
+
+        static int dataCells(int cols, int rows) { return cols * (rows - CAL_ROWS); }
+        static int capacityBytes(int cols, int rows) { return dataCells(cols, rows) / GROUP * GROUP_BYTES; }
+
+        /** How the capacity is split into Reed-Solomon blocks. Both sides compute this identically. */
+        record Layout(int blocks, int blockTotal, int ecc, int dataLen, int bodyLen) { }
+
+        static final Layout NOTHING = new Layout(0, 0, 0, 0, 0);
+
+        static Layout layout(int cols, int rows) {
+            int n = capacityBytes(cols, rows);
+            if (n < 16) return NOTHING;
+            int nb = Math.max(1, (n + RS_BLOCK - 1) / RS_BLOCK);   // blocks of at most 255 bytes
+            int bt = n / nb;
+            if (bt < 8) return NOTHING;
+            int e = Math.max(2, bt * RS_ECC / RS_BLOCK);           // about 8 per cent, as whole bytes
+            if (bt - e < 1) return NOTHING;
+            return new Layout(nb, bt, e, nb * (bt - e), nb * bt);
+        }
+
+        static int blocks(int cols, int rows) { return layout(cols, rows).blocks(); }
+        static int dataLen(int cols, int rows) { return layout(cols, rows).dataLen(); }
+
+        /** Bytes of GlassTransfer frame that fit in one raster of this size. */
+        static int frameCapacity(int cols, int rows) { return Math.max(0, dataLen(cols, rows) - 4); }
+
+        // ---- encoding (used by the self-test and by --make-raster) -----------------------
+
+        static byte[] encode(byte[] frame, int cols, int rows) {
+            Layout L = layout(cols, rows);
+            if (L.blocks() == 0 || frame.length > L.dataLen() - 4) throw new IllegalArgumentException("frame does not fit the raster");
+            int dpb = L.blockTotal() - L.ecc();
+            byte[] body = new byte[L.bodyLen()];
+            ByteBuffer.wrap(body).putInt(0, frame.length);
+            System.arraycopy(frame, 0, body, 4, frame.length);
+            int[] blk = new int[dpb];
+            for (int i = 0; i < L.blocks(); i++) {
+                for (int j = 0; j < dpb; j++) blk[j] = body[i * dpb + j] & 0xFF;
+                int[] enc = RS.encode(blk, L.ecc());
+                for (int j = 0; j < L.ecc(); j++) body[L.dataLen() + i * L.ecc() + j] = (byte) enc[dpb + j];
+            }
+            byte[] cells = new byte[cols * rows];
+            for (int c = 0; c < cols; c++) cells[c] = (byte) (c % SYMS);
+            int at = cols * CAL_ROWS, groups = dataCells(cols, rows) / GROUP;
+            for (int gi = 0; gi < groups; gi++) {
+                int p = gi * GROUP_BYTES;
+                int v = ((p < body.length ? body[p] & 0xFF : 0) << 8) | (p + 1 < body.length ? body[p + 1] & 0xFF : 0);
+                for (int k = GROUP - 1; k >= 0; k--, v /= SYMS) cells[at + gi * GROUP + k] = (byte) (v % SYMS);
+            }
+            return cells;
+        }
+
+        /** Renders cells to pixels exactly as the sender does, for offline tests. */
+        static Img render(byte[] cells, int cols, int rows, int cellPx) {
+            int edge = RIM + QUIET;
+            int w = (cols + 2 * edge) * cellPx, h = (rows + 2 * edge) * cellPx;
+            int[] px = new int[w * h];
+            Arrays.fill(px, 0xFFFFFF);
+            for (int y = 0; y < h; y++) {
+                int cy = y / cellPx - edge, row = y * w;
+                for (int x = 0; x < w; x++) {
+                    int cx = x / cellPx - edge;
+                    boolean inGrid = cx >= 0 && cx < cols && cy >= 0 && cy < rows;
+                    boolean inRim = !inGrid && cx >= -RIM && cx < cols + RIM && cy >= -RIM && cy < rows + RIM;
+                    if (inGrid) px[row + x] = colourOf(cells[cy * cols + cx]);
+                    else if (inRim) px[row + x] = GREY;
+                }
+            }
+            return new Img(px, w, h);
+        }
+
+        // ---- locating the grid ----------------------------------------------------------
+
+        /**
+         * What white looks like on this display, per channel: the level the brightest one per cent
+         * of the region reaches. The quiet zone is white, so it is always in the picture. Every
+         * other threshold is expressed against this, which is what lets a dimmed, tinted or
+         * washed out render still be read.
+         */
+        record White(int r, int g, int b) {
+            int mid(int k) { return (k == 0 ? r : k == 1 ? g : b) / 2; }
+            int tol(int k) { return Math.max(GREY_TOL / 2, (k == 0 ? r : k == 1 ? g : b) / 4); }
+        }
+
+        static White white(Img img) {
+            int[] hr = new int[256], hg = new int[256], hb = new int[256], px = img.px();
+            int step = Math.max(1, px.length / 200000), n = 0;
+            for (int i = 0; i < px.length; i += step, n++) {
+                int v = px[i];
+                hr[(v >>> 16) & 255]++; hg[(v >>> 8) & 255]++; hb[v & 255]++;
+            }
+            return new White(percentile(hr, n), percentile(hg, n), percentile(hb, n));
+        }
+
+        /** The level the brightest one per cent of the samples reach, floored well above black. */
+        static int percentile(int[] hist, int n) {
+            int want = Math.max(1, n / 100), seen = 0;
+            for (int b = 255; b >= 0; b--) { seen += hist[b]; if (seen >= want) return Math.max(64, b); }
+            return 255;
+        }
+
+        /** Mid-grey: each channel about half of white, and no channel far from the others. */
+        static boolean isGrey(int p, White w) {
+            int r = (p >>> 16) & 255, g = (p >>> 8) & 255, b = p & 255;
+            return Math.abs(r - w.mid(0)) <= w.tol(0)
+                && Math.abs(g - w.mid(1)) <= w.tol(1)
+                && Math.abs(b - w.mid(2)) <= w.tol(2);
+        }
+
+        /** A run of consecutive rows or columns that are mostly grey. */
+        record Band(int start, int len) { int end() { return start + len - 1; } }
+
+        static List<Band> bands(int[] count, int th, int max) {
+            List<Band> out = new ArrayList<>();
+            for (int i = 0; i < count.length; ) {
+                if (count[i] < th) { i++; continue; }
+                int j = i;
+                while (j < count.length && count[j] >= th) j++;
+                out.add(new Band(i, j - i));
+                i = j;
+            }
+            out.sort((a, b) -> b.len() - a.len());          // keep the most substantial few
+            return out.size() > max ? new ArrayList<>(out.subList(0, max)) : out;
+        }
+
+        /**
+         * Finds the grid by projecting the grey pixels onto rows and columns. The rim shows up as
+         * four bands of equal thickness; other grey things on screen, such as a window border, show
+         * up as bands too, so every combination is tried and the largest one that verifies wins.
+         */
+        /**
+         * Every rectangle in the region whose four grey bands are the same thickness, largest first.
+         * More than one can survive that test -- anything grey on the page below or beside the code
+         * makes a false rim of its own -- and nothing in the picture says which is right, so the
+         * caller decides by trying to decode them. A rim one row too far out reads every cell
+         * correctly and still fails, because the row count sets where the parity bytes begin.
+         */
+        static List<Geom> locate(Img img) {
+            int w = img.w(), h = img.h();
+            White wht = white(img);
+            say(String.format("white level: %d,%d,%d", wht.r(), wht.g(), wht.b()));
+            int[] px = img.px(), rowN = new int[h], colN = new int[w];
+            for (int y = 0; y < h; y++) {
+                int row = y * w, n = 0;
+                for (int x = 0; x < w; x++) if (isGrey(px[row + x], wht)) { n++; colN[x]++; }
+                rowN[y] = n;
+            }
+            int peakRow = 0, peakCol = 0;
+            for (int v : rowN) peakRow = Math.max(peakRow, v);
+            for (int v : colN) peakCol = Math.max(peakCol, v);
+            say(String.format("grey peaks: row %d, column %d", peakRow, peakCol));
+            if (peakRow < 16 || peakCol < 8) { say("not enough grey to be a rim"); return List.of(); }
+
+            List<Band> rowBands = bands(rowN, Math.max(8, peakRow * 7 / 10), 6);
+            List<Band> colBands = bands(colN, Math.max(4, peakCol * 7 / 10), 6);
+            say("row bands " + rowBands + ", column bands " + colBands);
+
+            List<Geom> found = new ArrayList<>();
+            for (Band top : rowBands) for (Band bottom : rowBands) {
+                if (bottom.start() <= top.end() || bottom.len() != top.len()) continue;
+                int t = top.len();
+                if (t < RIM || t % RIM != 0) continue;
+                int cellPx = t / RIM;
+                int innerH = bottom.start() - top.end() - 1;
+                if (innerH < cellPx || innerH % cellPx != 0) continue;
+                int rows = innerH / cellPx;
+                if (rows < CAL_ROWS + 1) continue;
+                for (Band left : colBands) for (Band right : colBands) {
+                    if (right.start() <= left.end() || left.len() != t || right.len() != t) continue;
+                    int innerW = right.start() - left.end() - 1;
+                    if (innerW % cellPx != 0) continue;
+                    int cols = innerW / cellPx;
+                    if (cols < 8 || layout(cols, rows).blocks() == 0) continue;
+                    Geom g = new Geom(left.end() + 1, top.end() + 1, cellPx, cols, rows);
+                    if (verify(img, g, wht)) found.add(g);
+                }
+            }
+            found.sort((p, q) -> Long.compare((long) q.cols() * q.rows(), (long) p.cols() * p.rows()));
+            if (found.size() > MAX_CANDIDATES) found = new ArrayList<>(found.subList(0, MAX_CANDIDATES));
+            if (found.isEmpty()) say("no combination of grey bands formed a rim");
+            else say("candidate grids: " + found.stream()
+                .map(g -> g.cols() + "x" + g.rows() + " at " + g.cellPx() + " px").toList());
+            return found;
+        }
+
+        /** Cheap check that a cached geometry still describes what is on screen. */
+        static boolean verify(Img img, Geom g) { return verify(img, g, white(img)); }
+
+        static boolean verify(Img img, Geom g, White w) {
+            if (g.x0() < g.cellPx() * RIM || g.y0() < g.cellPx() * RIM) return false;
+            if (g.x0() + g.width() + g.cellPx() * RIM > img.w()) return false;
+            if (g.y0() + g.height() + g.cellPx() * RIM > img.h()) return false;
+            int t = g.cellPx() * RIM;
+            for (int i = 1; i < 8; i++) {                       // sample the rim on all four sides
+                int x = g.x0() + g.width() * i / 8, y = g.y0() + g.height() * i / 8;
+                if (!isGrey(img.at(x, g.y0() - t / 2), w) || !isGrey(img.at(x, g.y0() + g.height() + t / 2 - 1), w)) return false;
+                if (!isGrey(img.at(g.x0() - t / 2, y), w) || !isGrey(img.at(g.x0() + g.width() + t / 2 - 1, y), w)) return false;
+            }
+            for (int i = 1; i < 8; i++) {                       // the inside must not be grey too
+                int x = g.x0() + g.width() * i / 8, y = g.y0() + g.height() * i / 8;
+                if (!isGrey(img.at(x, y), w)) return true;
+            }
+            return false;
+        }
+
+        // ---- reading cells --------------------------------------------------------------
+
+        /** Mean colour of one cell, packed as 0xRRGGBB. */
+        static int cellMean(Img img, Geom g, int col, int row) {
+            int cp = g.cellPx(), sr = 0, sg = 0, sb = 0;
+            int px0 = g.x0() + col * cp, py0 = g.y0() + row * cp;
+            for (int dy = 0; dy < cp; dy++) {
+                int base = (py0 + dy) * img.w() + px0;
+                for (int dx = 0; dx < cp; dx++) {
+                    int v = img.px()[base + dx];
+                    sr += (v >>> 16) & 255; sg += (v >>> 8) & 255; sb += v & 255;
+                }
+            }
+            int n = cp * cp;
+            return ((sr / n) << 16) | ((sg / n) << 8) | (sb / n);
+        }
+
+        /**
+         * The colour each of the five symbols actually came back as, measured off the calibration
+         * row on every frame. A cell is then read as whichever of the five it landed nearest to.
+         *
+         * Nearest to a measured colour, rather than any rule about which channel is strongest: on a
+         * compressed capture a black cell arrives faintly tinted, and every dominance test calls
+         * that red. Measuring instead of assuming is also what makes shade irrelevant, since a
+         * dimmed or tinted display moves the references exactly as far as it moves the cells.
+         */
+        record Levels(int[] r, int[] g, int[] b) {
+            /** Squared distance from a cell whose pixel sums are these, times the pixel count. */
+            long distance(int sym, int sr, int sg, int sb, int area) {
+                return (long) area * (r[sym] * r[sym] + g[sym] * g[sym] + b[sym] * b[sym])
+                     - 2L * (sr * r[sym] + sg * g[sym] + sb * b[sym]);
+            }
+        }
+
+        /** Two references closer together than this cannot be told apart, so the frame is refused. */
+        static final int MIN_SEPARATION = 64;
+
+        /** How many candidate rectangles are worth a decode attempt before giving up on a frame. */
+        static final int MAX_CANDIDATES = 6;
+
+        static Levels levels(Img img, Geom g) {
+            long[] sr = new long[SYMS], sg = new long[SYMS], sb = new long[SYMS];
+            int[] n = new int[SYMS], r = new int[SYMS], gr = new int[SYMS], b = new int[SYMS];
+            for (int c = 0; c < g.cols(); c++) {
+                int m = cellMean(img, g, c, 0), s = c % SYMS;
+                sr[s] += (m >>> 16) & 255; sg[s] += (m >>> 8) & 255; sb[s] += m & 255; n[s]++;
+            }
+            for (int s = 0; s < SYMS; s++) {
+                if (n[s] == 0) return null;                           // fewer cells than colours
+                r[s] = (int) (sr[s] / n[s]); gr[s] = (int) (sg[s] / n[s]); b[s] = (int) (sb[s] / n[s]);
+            }
+            for (int i = 0; i < SYMS; i++)
+                for (int j = i + 1; j < SYMS; j++) {
+                    int dr = r[i] - r[j], dg = gr[i] - gr[j], db = b[i] - b[j];
+                    if (dr * dr + dg * dg + db * db < MIN_SEPARATION * MIN_SEPARATION) return null;
+                }
+            Levels lv = new Levels(r, gr, b);
+            int agree = 0;                                            // does the row read back as itself?
+            for (int c = 0; c < g.cols(); c++) {
+                int m = cellMean(img, g, c, 0);
+                long bestD = Long.MAX_VALUE;
+                int best = 0;
+                for (int sym = 0; sym < SYMS; sym++) {
+                    long d = lv.distance(sym, (m >>> 16) & 255, (m >>> 8) & 255, m & 255, 1);
+                    if (d < bestD) { bestD = d; best = sym; }
+                }
+                if (best == c % SYMS) agree++;
+            }
+            if (agree * 10 < g.cols() * 9) return null;               // not a calibration row at all
+            return lv;
+        }
+
+        static byte[] readCells(Img img, Geom g, Levels lv) {
+            int cols = g.cols(), rows = g.rows(), cp = g.cellPx(), area = cp * cp;
+            byte[] cells = new byte[cols * rows];
+            long[] fixed = new long[SYMS];                           // the part that does not vary
+            for (int s = 0; s < SYMS; s++)
+                fixed[s] = (long) area * (lv.r()[s] * lv.r()[s] + lv.g()[s] * lv.g()[s] + lv.b()[s] * lv.b()[s]);
+            int[] px = img.px();
+            for (int r = 0; r < rows; r++) {
+                int py0 = g.y0() + r * cp, out = r * cols;
+                for (int c = 0; c < cols; c++) {
+                    int px0 = g.x0() + c * cp, sr = 0, sg = 0, sb = 0;
+                    for (int dy = 0; dy < cp; dy++) {
+                        int base = (py0 + dy) * img.w() + px0;
+                        for (int dx = 0; dx < cp; dx++) {
+                            int v = px[base + dx];
+                            sr += (v >>> 16) & 255; sg += (v >>> 8) & 255; sb += v & 255;
+                        }
+                    }
+                    int best = 0;
+                    long bestD = Long.MAX_VALUE;
+                    for (int sym = 0; sym < SYMS; sym++) {
+                        long d = fixed[sym] - 2L * (sr * lv.r()[sym] + sg * lv.g()[sym] + sb * lv.b()[sym]);
+                        if (d < bestD) { bestD = d; best = sym; }
+                    }
+                    cells[out + c] = (byte) best;
+                }
+            }
+            return cells;
+        }
+
+        // ---- cells back to bytes --------------------------------------------------------
+
+        static byte[] cellsToBody(byte[] cells, int cols, int rows) {
+            byte[] body = new byte[layout(cols, rows).bodyLen()];
+            int at = cols * CAL_ROWS, groups = dataCells(cols, rows) / GROUP;
+            for (int gi = 0; gi < groups; gi++) {
+                int p = gi * GROUP_BYTES;
+                if (p >= body.length) break;
+                int v = 0, off = at + gi * GROUP;
+                for (int k = 0; k < GROUP; k++) v = v * SYMS + (cells[off + k] & 0xFF);
+                body[p] = (byte) (v >>> 8);                           // a misread group can land above
+                if (p + 1 < body.length) body[p + 1] = (byte) v;      // 65535; Reed-Solomon sees bytes
+            }
+            return body;
+        }
+
+        /** Pulls the frame out of the data area; returns null if the length field is nonsense. */
+        static byte[] frameOf(byte[] body, Layout L) {
+            if (body.length < 4) return null;
+            int len = ByteBuffer.wrap(body).getInt(0);
+            if (len < Protocol.HEADER || len > L.dataLen() - 4) return null;
+            return Arrays.copyOfRange(body, 4, 4 + len);
+        }
+
+        /** Reed-Solomon over every block; returns the number of repaired bytes, or -1 if beyond repair. */
+        static int repair(byte[] body, Layout L) {
+            int dpb = L.blockTotal() - L.ecc(), corrected = 0, failed = 0, firstFail = -1, lastFail = -1;
+            int[] blk = new int[L.blockTotal()];
+            for (int i = 0; i < L.blocks(); i++) {
+                for (int j = 0; j < dpb; j++) blk[j] = body[i * dpb + j] & 0xFF;
+                for (int j = 0; j < L.ecc(); j++) blk[dpb + j] = body[L.dataLen() + i * L.ecc() + j] & 0xFF;
+                try { corrected += RS.correct(blk, L.ecc()); }
+                catch (IllegalStateException e) {
+                    if (!DEBUG) return -1;
+                    failed++;
+                    if (firstFail < 0) firstFail = i;
+                    lastFail = i;
+                    continue;
+                }
+                for (int j = 0; j < dpb; j++) body[i * dpb + j] = (byte) blk[j];
+            }
+            if (failed > 0) {
+                say(String.format("%d of %d blocks beyond repair (blocks %d..%d), %d bytes fixed elsewhere;"
+                    + " each block holds %d bytes and can fix %d",
+                    failed, L.blocks(), firstFail, lastFail, corrected, L.blockTotal(), L.ecc() / 2));
+                return -1;
+            }
+            return corrected;
+        }
+
+        /** Diagnostic: do the error-correction bytes in this image agree with its data bytes? */
+        static int checkEcc(Img img) {
+            Raster r = new Raster();
+            if (r.read(img).kind() != Kind.OK || r.geo == null) return -2;
+            Levels lv = levels(img, r.geo);
+            if (lv == null) return -2;
+            byte[] cells = readCells(img, r.geo, lv);
+            byte[] body = cellsToBody(cells, r.geo.cols(), r.geo.rows());
+            return repair(body, layout(r.geo.cols(), r.geo.rows()));
+        }
+
+        // ---- carrier ---------------------------------------------------------------------
+
+        Geom geo;
+        long lastHash;
+        Out lastOut;
+        int fails;
+
+        static long hashCells(byte[] cells) {                  // sparse, for change detection
+            long h = 0x9E3779B97F4A7C15L;
+            int step = Math.max(1, cells.length / 4096);
+            for (int i = 0; i < cells.length; i += step) h = (h ^ cells[i]) * 0x100000001B3L;
+            return h ^ cells.length;
+        }
+
+        @Override public void forget() { geo = null; lastOut = null; }
+
+        @Override public String name() { return "raster"; }
+
+        @Override public Out read(Img img) {
+            if (geo != null && !verify(img, geo)) geo = null;
+            if (geo != null) {                                          // the rectangle that worked last
+                Out out = attempt(img, geo, true);
+                if (out.kind() == Kind.OK || !out.changed()) { fails = 0; return out; }
+                if (++fails < 5) return out;                            // a torn frame; keep the geometry
+                geo = null;
+                fails = 0;
+            }
+            Out first = null;                                           // else try each candidate rim
+            for (Geom g : locate(img)) {
+                Out out = attempt(img, g, false);
+                if (out.kind() == Kind.OK) {
+                    geo = g;
+                    say(String.format("locked on to %dx%d cells at %d px", g.cols(), g.rows(), g.cellPx()));
+                    return out;
+                }
+                if (first == null) first = out;
+            }
+            return first != null ? first : new Out(Kind.NONE, true, null, "", null);
+        }
+
+        /** One decode against one candidate rectangle. Kind.OK only when a frame comes out whole. */
+        Out attempt(Img img, Geom g, boolean cached) {
+            Rectangle bounds = new Rectangle(g.x0(), g.y0(), g.width(), g.height());
+            Levels lv = levels(img, g);
+            if (lv == null) return lastOut = new Out(Kind.NONE, true, null, "", bounds);
+            byte[] cells = readCells(img, g, lv);
+            long h = hashCells(cells);
+            if (cached && lastOut != null && h == lastHash)
+                return new Out(lastOut.kind(), false, lastOut.bytes(), lastOut.info(), bounds);
+            lastHash = h;
+
+            Layout L = layout(g.cols(), g.rows());
+            byte[] body = cellsToBody(cells, g.cols(), g.rows());
+            byte[] frame = frameOf(body, L);
+            if (frame != null && Protocol.parse(frame) != null)         // clean capture: no repair needed
+                return lastOut = new Out(Kind.OK, true, frame,
+                    String.format("%dx%d cells, %d px, no repair", g.cols(), g.rows(), g.cellPx()), bounds);
+
+            int corrected = repair(body, L);                            // something was misread
+            if (corrected >= 0) {
+                frame = frameOf(body, L);
+                if (frame != null && Protocol.parse(frame) != null)
+                    return lastOut = new Out(Kind.OK, true, frame,
+                        String.format("%dx%d cells, %d px, repaired %d byte(s)", g.cols(), g.rows(), g.cellPx(), corrected), bounds);
+            }
+            return lastOut = new Out(Kind.FAIL, true, null, "", bounds);
+        }
+    }
+
+    // =========================================================================================
     // Transfer state machine
     // =========================================================================================
 
@@ -1247,7 +1829,7 @@ public final class GlassReceiver {
         final Capture cap;
         final Keys keys;
         final Border border;
-        final QrDecoder dec = new QrDecoder();
+        final Carrier carrier;
         final long armNanos;
 
         State state = State.ARMING;
@@ -1273,41 +1855,42 @@ public final class GlassReceiver {
         long capNs, decNs, frames;
         int dumps, misses;
 
-        Transfer(Config cfg, Capture cap, Keys keys, Border border) {
-            this.cfg = cfg; this.cap = cap; this.keys = keys; this.border = border;
+        Transfer(Config cfg, Capture cap, Keys keys, Border border, Carrier carrier) {
+            this.cfg = cfg; this.cap = cap; this.keys = keys; this.border = border; this.carrier = carrier;
             armNanos = (long) (cfg.armSeconds * 1e9);
         }
 
         void ui(Color c, String t) { uiColor = c; uiText = t; }
 
+        static final boolean TTY = System.console() != null;   // only a real terminal gets escapes
+
         /** Percentage-bearing title for the terminal and the receiver's windows. */
         void setTitle(String t) {
             if (t.equals(title)) return;
             title = t;
-            System.out.print("\u001b]0;" + t + "\u0007");
-            System.out.flush();
+            if (TTY) { System.out.print("\u001b]0;" + t + "\u0007"); System.out.flush(); }
             border.setTitle(t);
         }
 
         int percent() { return total <= 0 ? 100 : (int) (100L * haveCount / total); }
 
         void run() throws Exception {
-            log("Watching the region. Click into the sender's chunk field; the transfer starts after "
-                + cfg.armSeconds + " s of continuous QR detection.");
-            setTitle("GlassTransfer - waiting for a QR code");
+            log("Watching the region for the " + carrier.name() + " carrier. Click into the sender's chunk field;"
+                + " the transfer starts after " + cfg.armSeconds + " s of continuous detection.");
+            setTitle("GlassTransfer - waiting for a code");
             while (true) {
                 long t0 = System.nanoTime();
-                Gray g = cap.grab();
+                Img img = cap.grab();
                 long t1 = System.nanoTime();
-                QrDecoder.Result r = dec.process(g);
+                Carrier.Out r = carrier.read(img);
                 long now = System.nanoTime();
                 capNs += t1 - t0; decNs += now - t1; frames++;
-                if (r.kind() == QrDecoder.Kind.OK) { cap.tighten(dec.geo); misses = 0; }
-                else if (r.changed() && ++misses >= 25) { cap.widen(); dec.geo = null; misses = 0; }
-                Protocol.Frame f = r.kind() == QrDecoder.Kind.OK ? Protocol.parse(r.decoded().bytes()) : null;
-                if (cfg.verbose && r.changed()) log("frame " + r.kind() + (f != null ? " " + f : ""));
+                if (r.kind() == Kind.OK) { cap.tighten(r.bounds()); misses = 0; }
+                else if (r.changed() && ++misses >= 25) { cap.widen(); carrier.forget(); misses = 0; }
+                Protocol.Frame f = r.kind() == Kind.OK ? Protocol.parse(r.bytes()) : null;
+                if (cfg.verbose && r.changed()) log("frame " + r.kind() + (f != null ? " " + f : "") + "  " + r.info());
                 try {
-                    if (state == State.ARMING) arming(r, f, now); else transferring(r, f, g, now);
+                    if (state == State.ARMING) arming(r, f, now); else transferring(r, f, img, now);
                 } catch (IOException e) {
                     log("I/O error: " + e);
                     abort();
@@ -1320,7 +1903,7 @@ public final class GlassReceiver {
 
         // ---- arming ------------------------------------------------------------------------
 
-        void arming(QrDecoder.Result r, Protocol.Frame f, long now) throws IOException {
+        void arming(Carrier.Out r, Protocol.Frame f, long now) throws IOException {
             boolean ignoredEnd = f != null && f.type() == Protocol.END && ignoreEndOf != null && ignoreEndOf == f.fileId();
             boolean armable = f != null && !ignoredEnd && (f.type() == Protocol.DATA || f.total() == 0);
             if (armable) {
@@ -1329,7 +1912,7 @@ public final class GlassReceiver {
                 lastValidAt = now;
                 double left = (armNanos - (now - greenSince)) / 1e9;
                 if (left <= 0) { begin(f, now); return; }
-                ui(GREEN, String.format("QR detected (chunk %d of %d) - starting in %.0f s", f.index(), f.total(), Math.ceil(left)));
+                ui(GREEN, String.format("Code detected (chunk %d of %d) - starting in %.0f s", f.index(), f.total(), Math.ceil(left)));
                 setTitle(String.format("GlassTransfer - starting in %.0f s", Math.ceil(left)));
             } else if (f != null) {
                 lastValidAt = now;
@@ -1338,8 +1921,8 @@ public final class GlassReceiver {
                 else ui(GREEN, "END frame shown - navigate to a data chunk to start");
             } else if (now - lastValidAt > 300_000_000L) {
                 greenSince = 0;
-                ui(GREY, r.kind() == QrDecoder.Kind.FAIL ? "QR seen but not decodable" : "No QR detected in the region");
-                setTitle("GlassTransfer - waiting for a QR code");
+                ui(GREY, r.kind() == Kind.FAIL ? "Code seen but not decodable" : "No code detected in the region");
+                setTitle("GlassTransfer - waiting for a code");
             }
         }
 
@@ -1409,12 +1992,12 @@ public final class GlassReceiver {
 
         // ---- transferring --------------------------------------------------------------
 
-        void transferring(QrDecoder.Result r, Protocol.Frame f, Gray g, long now) throws IOException {
+        void transferring(Carrier.Out r, Protocol.Frame f, Img img, long now) throws IOException {
             if (f != null) lastValidAt = now;
             if (!r.changed()) { idle(now, f); return; }
             if (f == null) {                       // blank canvas or torn frame: the browser is reacting, wait
                 lastKeyAt = now;
-                if (r.kind() == QrDecoder.Kind.FAIL) dumpFail(g);
+                if (r.kind() == Kind.FAIL) dumpFail(img);
                 return;
             }
             onFrame(f, now);
@@ -1528,9 +2111,9 @@ public final class GlassReceiver {
                     else drive(total, now);
                 }
             }
-            if (f == null && now - lastValidAt > 2_000_000_000L) ui(ORANGE, "Signal lost - no QR in the region");
+            if (f == null && now - lastValidAt > 2_000_000_000L) ui(ORANGE, "Signal lost - no code in the region");
             if (now - lastValidAt > 60_000_000_000L) {
-                log("No QR for 60 s; closing the file, " + part.getFileName() + " is kept for resume");
+                log("No code for 60 s; closing the file, " + part.getFileName() + " is kept for resume");
                 abort();
             }
         }
@@ -1621,12 +2204,12 @@ public final class GlassReceiver {
             armHasId = false;
         }
 
-        void dumpFail(Gray g) {
+        void dumpFail(Img img) {
             if (cfg.dumpFail == null || dumps >= 20) return;
             try {
                 Path dir = Paths.get(cfg.dumpFail);
                 Files.createDirectories(dir);
-                ImageIO.write(g.toImage(), "png", dir.resolve(String.format("fail_%02d.png", dumps++)).toFile());
+                ImageIO.write(img.toImage(), "png", dir.resolve(String.format("fail_%02d.png", dumps++)).toFile());
             } catch (IOException e) {
                 log("cannot dump frame: " + e);
             }
@@ -1769,12 +2352,12 @@ public final class GlassReceiver {
                     QrDecoder.Result r = dec.process(g);
                     decodeNs += System.nanoTime() - t0;
                     String what = "round trip v" + ver + " ecl " + ecl + " mask " + mask + " pitch " + pitch + " bytes " + data.length;
-                    boolean ok = r.kind() == QrDecoder.Kind.OK && r.decoded().version() == ver && r.decoded().ecl() == ecl
+                    boolean ok = r.kind() == Kind.OK && r.decoded().version() == ver && r.decoded().ecl() == ecl
                         && r.decoded().mask() == mask && Arrays.equals(r.decoded().bytes(), data);
-                    check(ok, what + (r.kind() == QrDecoder.Kind.OK ? " (decoded but mismatch)" : " (" + r.kind() + ")"));
+                    check(ok, what + (r.kind() == Kind.OK ? " (decoded but mismatch)" : " (" + r.kind() + ")"));
                     if (ok) {
                         QrDecoder.Result again = dec.process(g);
-                        check(!again.changed() && again.kind() == QrDecoder.Kind.OK, what + " unchanged-frame detection");
+                        check(!again.changed() && again.kind() == Kind.OK, what + " unchanged-frame detection");
                         trips++;
                     }
                 }
@@ -1787,13 +2370,235 @@ public final class GlassReceiver {
                 boolean[][] m = encodeQr(data, 40, 0, 2);
                 for (int i = 0; i < 40; i++) { int x = 20 + rnd.nextInt(140), y = 20 + rnd.nextInt(140); m[y][x] = !m[y][x]; }
                 QrDecoder.Result r = new QrDecoder().process(render(m, 4, 12, 0, 255));
-                check(r.kind() == QrDecoder.Kind.OK && Arrays.equals(r.decoded().bytes(), data) && r.decoded().corrected() > 0,
-                    "v40-L with 40 flipped modules decodes (corrected " + (r.kind() == QrDecoder.Kind.OK ? r.decoded().corrected() : -1) + ")");
+                check(r.kind() == Kind.OK && Arrays.equals(r.decoded().bytes(), data) && r.decoded().corrected() > 0,
+                    "v40-L with 40 flipped modules decodes (corrected " + (r.kind() == Kind.OK ? r.decoded().corrected() : -1) + ")");
+            }
+
+
+            // ---- colour raster: encode, render, read back -------------------------------
+            int[][] shapes = {{64, 40, 1}, {120, 80, 2}, {200, 150, 2}, {585, 630, 2}, {97, 53, 3}};
+            check(Raster.frameCapacity(16, 3) == 0 && Raster.blocks(16, 3) == 0, "a raster too small to hold a block reports no capacity");
+            for (int[] shape : shapes) {
+                int cols = shape[0], rows = shape[1], cellPx = shape[2];
+                int cap = Raster.frameCapacity(cols, rows);
+                String what = "raster " + cols + "x" + rows + " at " + cellPx + " px (frame capacity " + cap + " B)";
+                if (cap <= Protocol.HEADER + 8) { check(false, what + " is too small to test"); continue; }
+                byte[] chunk = new byte[cap - Protocol.HEADER];
+                rnd.nextBytes(chunk);
+                byte[] frame = Protocol.build(Protocol.DATA, 0x5A5A1234, 3, 9, chunk.length, chunk);
+                check(frame.length == cap, what + ": frame exactly fills the capacity");
+                byte[] cells = Raster.encode(frame, cols, rows);
+                Img img = Raster.render(cells, cols, rows, cellPx);
+                Raster dec = new Raster();
+                Carrier.Out out = dec.read(img);
+                boolean good = out.kind() == Kind.OK && Arrays.equals(out.bytes(), frame);
+                check(good, what + " round trip" + (out.kind() == Kind.OK ? " (decoded but different)" : " (" + out.kind() + ")"));
+                if (good) {
+                    Raster.Geom g = dec.geo;
+                    check(g.cols() == cols && g.rows() == rows && g.cellPx() == cellPx,
+                        what + ": geometry recovered from the image alone");
+                    check(!dec.read(img).changed(), what + ": an identical frame is reported unchanged");
+                }
+            }
+
+            // A handful of misread cells must be repaired rather than rejected.
+            {
+                int cols = 200, rows = 150, cellPx = 2;
+                byte[] chunk = new byte[Raster.frameCapacity(cols, rows) - Protocol.HEADER];
+                rnd.nextBytes(chunk);
+                byte[] frame = Protocol.build(Protocol.DATA, 7, 0, 2, chunk.length, chunk);
+                byte[] cells = Raster.encode(frame, cols, rows);
+
+                Raster.Layout L = Raster.layout(cols, rows);
+                int dpb = L.blockTotal() - L.ecc(), perBlock = 3;
+                byte[] hurt = cells.clone();
+                for (int b = 0; b < L.blocks(); b++) {              // a few cells inside every block
+                    int firstGroup = b * dpb / Raster.GROUP_BYTES;
+                    for (int k = 0; k < perBlock; k++) {            // in separate groups: separate bytes
+                        int at = cols * Raster.CAL_ROWS + (firstGroup + 2 + k * 5) * Raster.GROUP;
+                        if (at < cells.length) hurt[at] = (byte) ((hurt[at] + 1 + rnd.nextInt(4)) % Raster.SYMS);
+                    }
+                }
+                Carrier.Out out = new Raster().read(Raster.render(hurt, cols, rows, cellPx));
+                check(out.kind() == Kind.OK && Arrays.equals(out.bytes(), frame),
+                    "raster repairs " + perBlock + " damaged cells in each of " + L.blocks() + " blocks");
+
+                byte[] wrecked = cells.clone();
+                for (int i = 0; i < Raster.dataCells(cols, rows) / 3; i++) {
+                    int at = cols * Raster.CAL_ROWS + rnd.nextInt(Raster.dataCells(cols, rows));
+                    wrecked[at] = (byte) ((wrecked[at] + 1 + rnd.nextInt(4)) % Raster.SYMS);
+                }
+                Carrier.Out bad = new Raster().read(Raster.render(wrecked, cols, rows, cellPx));
+                check(bad.kind() != Kind.OK, "raster reports failure rather than wrong data when a third of the cells are wrong");
+            }
+
+            // A display that renders the colours badly must still decode. Shade is not what
+            // identifies a cell: which channel dominates is.
+            {
+                int cols = 160, rows = 120, cellPx = 2;
+                byte[] chunk = new byte[Raster.frameCapacity(cols, rows) - Protocol.HEADER];
+                rnd.nextBytes(chunk);
+                byte[] frame = Protocol.build(Protocol.DATA, 3, 1, 4, chunk.length, chunk);
+                byte[] cells = Raster.encode(frame, cols, rows);
+                Img clean = Raster.render(cells, cols, rows, cellPx);
+                String[] names = {"dimmed to 45 per cent", "contrast squeezed into 40..200",
+                                  "channels gained 0.9/0.75/0.6", "noise of plus or minus 24",
+                                  "dimmed, tinted and noisy at once"};
+                for (int k = 0; k < names.length; k++) {
+                    Img skewed = skew(clean, k, new Random(99 + k));
+                    Carrier.Out out = new Raster().read(skewed);
+                    check(out.kind() == Kind.OK && Arrays.equals(out.bytes(), frame),
+                        "raster reads a display " + names[k]);
+                }
+            }
+
+            // Rendered at a lower colour depth, which is what a remote session or a browser short
+            // of colours does. All five cell colours are entries in every palette that still counts
+            // as colour, so they come back exactly or near enough; the rim only has to stay between
+            // black and white rather than land on any particular grey.
+            {
+                int cols = 160, rows = 120, cellPx = 2;
+                byte[] chunk = new byte[Raster.frameCapacity(cols, rows) - Protocol.HEADER];
+                rnd.nextBytes(chunk);
+                byte[] frame = Protocol.build(Protocol.DATA, 5, 2, 4, chunk.length, chunk);
+                Img clean = Raster.render(Raster.encode(frame, cols, rows), cols, rows, cellPx);
+                Object[][] depths = {
+                    {"16 bit, 5-6-5", depth(clean, 5, 6, 5, false)},
+                    {"8 bit, 3-3-2", depth(clean, 3, 3, 2, false)},
+                    {"8 bit, 3-3-2, dithered", depth(clean, 3, 3, 2, true)},
+                    {"4 bit, 16 EGA colours", ega(clean, false)},
+                    {"4 bit, 16 EGA colours, dithered", ega(clean, true)},
+                };
+                for (Object[] d : depths) {
+                    Carrier.Out out = new Raster().read((Img) d[1]);
+                    check(out.kind() == Kind.OK && Arrays.equals(out.bytes(), frame),
+                        "raster reads a render at " + d[0]);
+                }
+                // Below four bits there is no colour between black and white for the rim to be, so
+                // the grid cannot be found. It must say so rather than invent one.
+                check(new Raster().read(depth(clean, 1, 1, 1, true)).kind() != Kind.OK,
+                    "raster refuses a 3 bit render rather than misreading it");
+            }
+
+            // Anything grey below the code makes a second rectangle that passes for a rim, and it
+            // is the larger one. Reading it gets every cell right and still fails, because the row
+            // count decides where the parity begins, so every candidate has to be tried.
+            {
+                int cols = 160, rows = 120, cellPx = 2;
+                byte[] chunk = new byte[Raster.frameCapacity(cols, rows) - Protocol.HEADER];
+                rnd.nextBytes(chunk);
+                byte[] frame = Protocol.build(Protocol.DATA, 9, 3, 5, chunk.length, chunk);
+                byte[] cells = Raster.encode(frame, cols, rows);
+                for (int i = 300; i < Raster.dataCells(cols, rows); i += 500)   // needs the parity, as a
+                    cells[cols + i] = (byte) ((cells[cols + i] + 1) % Raster.SYMS);   // real capture does
+                Img clean = Raster.render(cells, cols, rows, cellPx);
+                int w = clean.w(), gap = 4 * cellPx, band = Raster.RIM * cellPx;
+                int h = clean.h() + gap + band + cellPx;
+                int[] px = new int[w * h];
+                Arrays.fill(px, 0xFFFFFF);
+                System.arraycopy(clean.px(), 0, px, 0, clean.px().length);
+                int in = Raster.QUIET * cellPx, out2 = (Raster.QUIET + Raster.RIM) * cellPx;
+                for (int y = clean.h(); y < clean.h() + gap; y++)      // sides carry on, as a window edge does
+                    for (int x = 0; x < w; x++)
+                        if ((x >= in && x < out2) || (x >= w - out2 && x < w - in)) px[y * w + x] = Raster.GREY;
+                for (int y = clean.h() + gap; y < clean.h() + gap + band; y++)
+                    for (int x = 0; x < w; x++) px[y * w + x] = Raster.GREY;
+                Carrier.Out out = new Raster().read(new Img(px, w, h));
+                check(out.kind() == Kind.OK && Arrays.equals(out.bytes(), frame),
+                    "raster ignores a false rim below the code and finds the real one");
+            }
+
+            // Nothing on screen, and a plain white field, must both read as "no code".
+            {
+                Img blank = new Img(new int[300 * 200], 300, 200);
+                Arrays.fill(blank.px(), 0xFFFFFF);
+                check(new Raster().read(blank).kind() == Kind.NONE, "a blank white field reads as no code");
+            }
+
+            // Capacity arithmetic must agree with what the layout can actually hold.
+            for (int[] shape : shapes) {
+                int cols = shape[0], rows = shape[1];
+                int cells = Raster.dataCells(cols, rows), bytes = Raster.capacityBytes(cols, rows);
+                Raster.Layout L = Raster.layout(cols, rows);
+                check(bytes / Raster.GROUP_BYTES * Raster.GROUP <= cells,
+                    "raster " + cols + "x" + rows + ": capacity fits the cells");
+                check(L.bodyLen() <= bytes && L.blockTotal() <= Raster.RS_BLOCK,
+                    "raster " + cols + "x" + rows + ": blocks fit the capacity");
             }
 
             System.out.println(failures == 0 ? "SELFTEST PASSED" : "SELFTEST FAILED: " + failures + " failure(s)");
             return failures == 0;
         }
+
+        // Ordered dithering, so a colour with no palette entry alternates rather than shifting.
+        static final int[] BAYER = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+
+        /** Quantises each channel to the given number of bits, as a 16 or 8 bit display would. */
+        static Img depth(Img src, int rb, int gb, int bb, boolean dither) {
+            int[] px = src.px().clone();
+            for (int y = 0; y < src.h(); y++) {
+                for (int x = 0; x < src.w(); x++) {
+                    int i = y * src.w() + x, v = px[i];
+                    int d = dither ? BAYER[(y & 3) * 4 + (x & 3)] : 8;
+                    px[i] = (level((v >>> 16) & 255, rb, d) << 16)
+                          | (level((v >>> 8) & 255, gb, d) << 8) | level(v & 255, bb, d);
+                }
+            }
+            return new Img(px, src.w(), src.h());
+        }
+
+        static int level(int v, int bits, int d) {
+            int steps = (1 << bits) - 1;
+            int t = clamp(v + (d - 8) * (255 / steps) / 16);
+            return (t * steps + 127) / 255 * 255 / steps;
+        }
+
+        /** The classic 16 colour palette: no pure primaries in it, and no 0x808080 either. */
+        static final int[] EGA = {
+            0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
+            0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF};
+
+        static Img ega(Img src, boolean dither) {
+            int[] px = src.px().clone();
+            for (int y = 0; y < src.h(); y++) {
+                for (int x = 0; x < src.w(); x++) {
+                    int i = y * src.w() + x, v = px[i];
+                    int d = dither ? (BAYER[(y & 3) * 4 + (x & 3)] - 8) * 4 : 0;
+                    int r = clamp(((v >>> 16) & 255) + d), g = clamp(((v >>> 8) & 255) + d), b = clamp((v & 255) + d);
+                    int best = 0, bestD = Integer.MAX_VALUE;
+                    for (int c : EGA) {
+                        int dr = ((c >>> 16) & 255) - r, dg = ((c >>> 8) & 255) - g, db = (c & 255) - b;
+                        int dist = dr * dr + dg * dg + db * db;
+                        if (dist < bestD) { bestD = dist; best = c; }
+                    }
+                    px[i] = best;
+                }
+            }
+            return new Img(px, src.w(), src.h());
+        }
+
+        /** Renders the same image the way a poor display or a lossy path would hand it back. */
+        static Img skew(Img src, int kind, Random rnd) {
+            int[] px = src.px().clone();
+            for (int i = 0; i < px.length; i++) {
+                int r = (px[i] >>> 16) & 255, g = (px[i] >>> 8) & 255, b = px[i] & 255;
+                switch (kind) {
+                    case 0 -> { r = r * 45 / 100; g = g * 45 / 100; b = b * 45 / 100; }
+                    case 1 -> { r = 40 + r * 160 / 255; g = 40 + g * 160 / 255; b = 40 + b * 160 / 255; }
+                    case 2 -> { r = r * 90 / 100; g = g * 75 / 100; b = b * 60 / 100; }
+                    case 3 -> { r += rnd.nextInt(49) - 24; g += rnd.nextInt(49) - 24; b += rnd.nextInt(49) - 24; }
+                    default -> {
+                        r = r * 60 / 100 + rnd.nextInt(21) - 10;
+                        g = g * 50 / 100 + rnd.nextInt(21) - 10;
+                        b = b * 40 / 100 + rnd.nextInt(21) - 10;
+                    }
+                }
+                px[i] = (clamp(r) << 16) | (clamp(g) << 8) | clamp(b);
+            }
+            return new Img(px, src.w(), src.h());
+        }
+
+        static int clamp(int v) { return v < 0 ? 0 : v > 255 ? 255 : v; }
 
         static void corrupt(int[] c, int count, Random rnd) {
             boolean[] used = new boolean[c.length];

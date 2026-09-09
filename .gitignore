@@ -1,0 +1,7 @@
+received/
+out/
+testdata/
+*.png
+*.part
+*.map
+*.bin

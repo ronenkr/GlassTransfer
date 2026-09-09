@@ -10,8 +10,9 @@
   #entry { padding: 24px; max-width: 620px; }
   #entry h1 { font-size: 20px; margin: 0 0 12px; }
   .row { display: flex; gap: 8px; align-items: center; margin: 8px 0; flex-wrap: wrap; }
-  input[type=text], select { font: inherit; padding: 6px 8px; border: 1px solid #888; border-radius: 4px; background: #fff; color: #111; }
-  button { font: inherit; padding: 6px 14px; border: 1px solid #666; border-radius: 4px; background: #f3f3f3; color: #111; cursor: pointer; }
+  /* Nothing on this page may be mid-grey: that is how the receiver finds the code's rim. */
+  input[type=text], select { font: inherit; padding: 6px 8px; border: 1px solid #c8c8c8; border-radius: 4px; background: #fff; color: #111; }
+  button { font: inherit; padding: 6px 14px; border: 1px solid #2b2b2b; border-radius: 4px; background: #f3f3f3; color: #111; cursor: pointer; }
   button:hover { background: #e6e6e6; }
   button:disabled { opacity: .5; cursor: default; }
   #err { color: #b00020; min-height: 1.4em; white-space: pre-wrap; }
@@ -22,11 +23,12 @@
   #adv input { width: 60px; }
   #qrmode { position: fixed; inset: 0; }
   #qr { position: fixed; left: 0; top: 0; background: #fff; image-rendering: pixelated; image-rendering: crisp-edges; }
-  #panel { position: fixed; top: 0; padding: 12px; display: flex; flex-direction: column; gap: 10px; align-items: flex-start; max-width: 420px; }
-  #idx { width: 120px; font-size: 20px; text-align: right; }
-  #lbl { font-size: 17px; font-weight: 600; }
-  #meta { color: #444; font-size: 13px; word-break: break-all; }
-  #banner { display: none; background: #c62828; color: #fff; font-size: 20px; font-weight: 700; padding: 12px 14px; border-radius: 6px; }
+  #panel { position: fixed; left: 0; right: 0; bottom: 0; height: 60px; box-sizing: border-box;
+           padding: 6px 12px; display: flex; gap: 16px; align-items: center; background: #fff; border-top: 1px solid #dcdcdc; }
+  #idx { width: 110px; font-size: 20px; text-align: right; }
+  #lbl { font-size: 16px; font-weight: 600; white-space: nowrap; }
+  #meta { color: #3a3a3a; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #banner { display: none; background: #c62828; color: #fff; font-size: 17px; font-weight: 700; padding: 8px 12px; border-radius: 6px; white-space: nowrap; }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -43,9 +45,10 @@
   <details>
     <summary>Advanced</summary>
     <div id="adv">
-      <label>px / module <input type="text" id="px" value="4" inputmode="numeric"></label>
+      <label>carrier <select id="mode"><option value="raster">colour raster</option><option value="qr">QR</option></select></label>
+      <label>pixels per cell <input type="text" id="px" value="2" inputmode="numeric"></label>
       <label>QR version <input type="text" id="ver" value="40" inputmode="numeric"></label>
-      <label>ECC <select id="ecc"><option>L</option><option>M</option><option>Q</option><option>H</option></select></label>
+      <label>QR ECC <select id="ecc"><option>L</option><option>M</option><option>Q</option><option>H</option></select></label>
     </div>
   </details>
 </div>
@@ -908,13 +911,17 @@ var qrcodegen;
 <!-- Shared, DOM-free helpers used by both the main thread and the workers. -->
 <script id="shared">
 "use strict";
-const GT_HEADER = 21;                 // magic(2) type(1) fileId(4) index(4) total(4) chunkSize(2) crc(4)
+/* Frame layout, shared by the page and its encoder workers. Must match GlassReceiver.java. */
+const GT_HEADER = 23;            // magic(2) type(1) fileId(4) index(4) total(4) chunkSize(4) crc(4)
+const GT_PROTO = 3;
 const GT_ECLS = [qrcodegen.QrCode.Ecc.LOW, qrcodegen.QrCode.Ecc.MEDIUM, qrcodegen.QrCode.Ecc.QUARTILE, qrcodegen.QrCode.Ecc.HIGH];
+
 const CRC_T = (() => { const t = new Int32Array(256);
   for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c; }
   return t; })();
 function crcRaw(st, u8, off, end) { for (let i = off; i < end; i++) st = CRC_T[(st ^ u8[i]) & 255] ^ (st >>> 8); return st; }
 function crc32(u8, off = 0, end = u8.length) { return (crcRaw(-1, u8, off, end) ^ -1) >>> 0; }
+
 /* SHA-256, streaming. crypto.subtle is unavailable over plain http, so this is always used. */
 const SHA_K = new Uint32Array([
   0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
@@ -974,19 +981,16 @@ function shaFinal(st) {
   return out;
 }
 function sha256(u8) { const st = shaInit(); shaUpdate(st, u8, 0, u8.length); return shaFinal(st); }
-function packModules(qr) {            // row-major bitset, bit (y*size+x) set when dark
-  const s = qr.size, bits = new Uint8Array((s * s + 7) >> 3), mods = qr.modules;
-  for (let y = 0; y < s; y++) { const row = mods[y], base = y * s;
-    for (let x = 0; x < s; x++) if (row[x]) { const b = base + x; bits[b >> 3] |= 1 << (b & 7); } }
-  return bits;
-}
+
+/* ---- GlassTransfer frame ------------------------------------------------------------- */
 function writeHeader(frame, type, fileId, index, total, D) {
-  frame[0] = 0x47; frame[1] = 0x54; frame[2] = 0x20 | type;   // high nibble = protocol version 2
+  frame[0] = 0x47; frame[1] = 0x54; frame[2] = (GT_PROTO << 4) | type;
   const dv = new DataView(frame.buffer, frame.byteOffset, frame.byteLength);
-  dv.setUint32(3, fileId >>> 0); dv.setUint32(7, index >>> 0); dv.setUint32(11, total >>> 0); dv.setUint16(15, D); dv.setUint32(17, 0);
+  dv.setUint32(3, fileId >>> 0); dv.setUint32(7, index >>> 0); dv.setUint32(11, total >>> 0);
+  dv.setUint32(15, D >>> 0); dv.setUint32(19, 0);
 }
 function sealFrame(frame) {
-  new DataView(frame.buffer, frame.byteOffset, frame.byteLength).setUint32(17, crc32(frame)); return frame;
+  new DataView(frame.buffer, frame.byteOffset, frame.byteLength).setUint32(19, crc32(frame)); return frame;
 }
 function buildDataFrame(buf, i, D, fileId, total) {
   const start = i * D, end = Math.min(start + D, buf.length);
@@ -999,19 +1003,112 @@ function buildEndFrame(size, fileCrc, fileSha, name, fileId, total, D) {
   const frame = new Uint8Array(GT_HEADER + 8 + 4 + 32 + 2 + nb.length);
   writeHeader(frame, 1, fileId, total, total, D);
   const dv = new DataView(frame.buffer);
-  dv.setUint32(21, Math.floor(size / 4294967296)); dv.setUint32(25, size >>> 0);
-  dv.setUint32(29, fileCrc >>> 0);
-  frame.set(fileSha, 33);
-  dv.setUint16(65, nb.length); frame.set(nb, 67);
+  dv.setUint32(GT_HEADER, Math.floor(size / 4294967296)); dv.setUint32(GT_HEADER + 4, size >>> 0);
+  dv.setUint32(GT_HEADER + 8, fileCrc >>> 0);
+  frame.set(fileSha, GT_HEADER + 12);
+  dv.setUint16(GT_HEADER + 44, nb.length); frame.set(nb, GT_HEADER + 46);
   return sealFrame(frame);
 }
-function encodeFrame(frame, version, ecl) {
-  const seg = qrcodegen.QrSegment.makeBytes(frame);
-  return packModules(qrcodegen.QrCode.encodeSegments([seg], ecl, version, version, -1, true));
+
+/* ---- Reed-Solomon over GF(256), matching GlassReceiver's RS class --------------------- */
+const GF_EXP = new Uint8Array(512), GF_LOG = new Uint8Array(256);
+(() => { let x = 1;
+  for (let i = 0; i < 255; i++) { GF_EXP[i] = x; GF_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11D; }
+  for (let i = 255; i < 512; i++) GF_EXP[i] = GF_EXP[i - 255];
+})();
+function gfMul(a, b) { return (a === 0 || b === 0) ? 0 : GF_EXP[GF_LOG[a] + GF_LOG[b]]; }
+function rsDivisor(nsym) {
+  const div = new Uint8Array(nsym);
+  div[nsym - 1] = 1;
+  let root = 1;
+  for (let i = 0; i < nsym; i++) {
+    for (let j = 0; j < nsym; j++) {
+      div[j] = gfMul(div[j], root);
+      if (j + 1 < nsym) div[j] ^= div[j + 1];
+    }
+    root = gfMul(root, 2);
+  }
+  return div;
 }
-function capacityBytes(version, eclOrd) {  // byte-mode capacity of one QR
+function rsRemainder(data, from, to, div, rem) {
+  rem.fill(0);
+  const nsym = div.length;
+  for (let i = from; i < to; i++) {
+    const factor = data[i] ^ rem[0];
+    rem.copyWithin(0, 1);
+    rem[nsym - 1] = 0;
+    for (let j = 0; j < nsym; j++) rem[j] ^= gfMul(div[j], factor);
+  }
+  return rem;
+}
+
+/* ---- colour raster -------------------------------------------------------------------- */
+// Five colours: black, red, green, blue, white. A cell is read back by which channel dominates
+// rather than by matching a shade, so any display gets them right. Five is not a power of two, so
+// two bytes ride in seven cells as a base-5 number (5^7 = 78125 > 65535): 2.29 bits a cell.
+const R_QUIET = 4, R_RIM = 2, R_CAL = 1, R_BLOCK = 255, R_ECC = 20;
+const R_EDGE = R_QUIET + R_RIM;
+const R_SYMS = 5, R_GROUP = 7, R_GROUP_BYTES = 2;
+
+function rDataCells(cols, rows) { return cols * (rows - R_CAL); }
+function rCapacityBytes(cols, rows) { return Math.floor(rDataCells(cols, rows) / R_GROUP) * R_GROUP_BYTES; }
+function rLayout(cols, rows) {
+  const n = rCapacityBytes(cols, rows);
+  if (n < 16) return null;
+  const nb = Math.max(1, Math.ceil(n / R_BLOCK));
+  const bt = Math.floor(n / nb);
+  if (bt < 8) return null;
+  const e = Math.max(2, Math.floor(bt * R_ECC / R_BLOCK));
+  if (bt - e < 1) return null;
+  return { blocks: nb, blockTotal: bt, ecc: e, dataLen: nb * (bt - e), bodyLen: nb * bt };
+}
+function rFrameCapacity(cols, rows) { const L = rLayout(cols, rows); return L ? Math.max(0, L.dataLen - 4) : 0; }
+
+/** Frame bytes to cell symbols, row major, calibration row first. */
+function rEncode(frame, cols, rows) {
+  const L = rLayout(cols, rows);
+  if (!L || frame.length > L.dataLen - 4) throw new RangeError("frame does not fit the raster");
+  const dpb = L.blockTotal - L.ecc;
+  const body = new Uint8Array(L.bodyLen);
+  new DataView(body.buffer).setUint32(0, frame.length);
+  body.set(frame, 4);
+  const div = rsDivisor(L.ecc), rem = new Uint8Array(L.ecc);
+  for (let i = 0; i < L.blocks; i++) {
+    rsRemainder(body, i * dpb, i * dpb + dpb, div, rem);
+    body.set(rem, L.dataLen + i * L.ecc);
+  }
+  const cells = new Uint8Array(cols * rows);
+  for (let c = 0; c < cols; c++) cells[c] = c % R_SYMS;              // calibration row: every colour
+  const base = cols * R_CAL, groups = Math.floor(rDataCells(cols, rows) / R_GROUP);
+  for (let gi = 0; gi < groups; gi++) {
+    const p = gi * R_GROUP_BYTES;
+    let v = ((p < body.length ? body[p] : 0) << 8) | (p + 1 < body.length ? body[p + 1] : 0);
+    for (let k = R_GROUP - 1; k >= 0; k--) { cells[base + gi * R_GROUP + k] = v % R_SYMS; v = (v / R_SYMS) | 0; }
+  }
+  return cells;
+}
+
+/* ---- one entry point per carrier ------------------------------------------------------ */
+function encodeFrame(frame, version, ecl) {
+  return packModules(qrcodegen.QrCode.encodeSegments([qrcodegen.QrSegment.makeBytes(frame)], ecl, version, version, -1, true));
+}
+function packModules(qr) {
+  const s = qr.size, bits = new Uint8Array((s * s + 7) >> 3), mods = qr.modules;
+  for (let y = 0; y < s; y++) { const row = mods[y], base = y * s;
+    for (let x = 0; x < s; x++) if (row[x]) { const b = base + x; bits[b >> 3] |= 1 << (b & 7); } }
+  return bits;
+}
+function qrCapacityBytes(version, eclOrd) {
   const bits = qrcodegen.QrCode.getNumDataCodewords(version, GT_ECLS[eclOrd]) * 8;
   return Math.floor((bits - 4 - (version <= 9 ? 8 : 16)) / 8);
+}
+/** Bytes of frame one code can carry, for whichever carrier is in use. */
+function carrierCapacity(cfg) {
+  return cfg.mode === "qr" ? qrCapacityBytes(cfg.version, cfg.eclOrd) : rFrameCapacity(cfg.cols, cfg.rows);
+}
+/** Frame to whatever the renderer draws: QR module bits, or raster cell symbols. */
+function encodeCarrier(cfg, frame) {
+  return cfg.mode === "qr" ? encodeFrame(frame, cfg.version, GT_ECLS[cfg.eclOrd]) : rEncode(frame, cfg.cols, cfg.rows);
 }
 </script>
 
@@ -1029,13 +1126,13 @@ function digestSliced(off, st, sh) {           // CRC32 and SHA-256 of the whole
 onmessage = (e) => {
   const m = e.data;
   if (m.type === "init") {
-    W = { buf: m.buf, D: m.D, fileId: m.fileId, total: m.total, version: m.version, ecl: GT_ECLS[m.eclOrd] };
+    W = { buf: m.buf, D: m.D, fileId: m.fileId, total: m.total, cfg: m.cfg };
     if (m.computeCrc) digestSliced(0, -1, shaInit());
   } else if (m.type === "enc") {
     for (const i of m.indices) {
       try {
-        const bits = encodeFrame(buildDataFrame(W.buf, i, W.D, W.fileId, W.total), W.version, W.ecl);
-        postMessage({ type: "bits", i, bits }, [bits.buffer]);
+        const code = encodeCarrier(W.cfg, buildDataFrame(W.buf, i, W.D, W.fileId, W.total));
+        postMessage({ type: "code", i, code }, [code.buffer]);
       } catch (err) { postMessage({ type: "error", i, message: String(err) }); }
     }
   }
@@ -1050,9 +1147,25 @@ const prog = $("prog"), progbar = $("progbar"), canvas = $("qr"), panel = $("pan
 const lbl = $("lbl"), meta = $("meta"), banner = $("banner"), backBtn = $("back"), saveBtn = $("save"), diag = $("diag");
 const params = new URLSearchParams(location.search);
 const DEBUG = params.get("debug") === "1";
-const QUIET = 4, LOOKAHEAD = 64, CACHE_MAX = 128;
-let state = null;   // null on the entry screen
+const QUIET = 4;                       // QR quiet zone, in modules
+const PANEL_CSS = 60;                  // height of the control strip, in CSS pixels
+let state = null;                      // null on the entry screen
 let offc = null, offctx = null;
+
+// The five cell colours as packed canvas pixels, in symbol order.
+const LE = (() => { const b = new ArrayBuffer(4); new Uint32Array(b)[0] = 1; return new Uint8Array(b)[0] === 1; })();
+function pack32(r, g, b) { return (LE ? ((0xFF << 24) | (b << 16) | (g << 8) | r) : ((r << 24) | (g << 16) | (b << 8) | 0xFF)) >>> 0; }
+const PAL32 = new Uint32Array([pack32(0, 0, 0), pack32(255, 0, 0), pack32(0, 255, 0), pack32(0, 0, 255), pack32(255, 255, 255)]);
+const BLACK32 = PAL32[0], WHITE32 = PAL32[4], GREY32 = pack32(128, 128, 128);
+
+/** How many cells fit beside the control strip, at this many device pixels per cell. */
+function chooseGeometry(cellPx) {
+  const dpr = window.devicePixelRatio || 1;
+  const availW = Math.floor(window.innerWidth * dpr);
+  const availH = Math.floor((window.innerHeight - PANEL_CSS) * dpr);
+  return { cols: Math.max(8, Math.floor(availW / cellPx) - 2 * R_EDGE),
+           rows: Math.max(2, Math.floor(availH / cellPx) - 2 * R_EDGE) };
+}
 
 let lastMsg = "none";
 function dbg() {
@@ -1084,11 +1197,18 @@ async function loadFile(name) {
   name = (name || "").trim();
   if (!name) { err.textContent = "Enter a file name."; return; }
   if (location.protocol === "file:") { err.textContent = serverHint(); return; }
-  const version = clampInt($("ver").value, 1, 40, 40);
-  const eclOrd = Math.max(0, ["L", "M", "Q", "H"].indexOf($("ecc").value));
-  const px = clampInt($("px").value, 1, 40, 4);
-  const D = capacityBytes(version, eclOrd) - GT_HEADER;
-  if (D < 1) { err.textContent = "QR version " + version + " is too small for the frame header; use version 2 or higher."; return; }
+  const cfg = { mode: $("mode").value === "qr" ? "qr" : "raster",
+                version: clampInt($("ver").value, 1, 40, 40),
+                eclOrd: Math.max(0, ["L", "M", "Q", "H"].indexOf($("ecc").value)),
+                cellPx: clampInt($("px").value, 1, 16, 2) };
+  if (cfg.mode === "raster") Object.assign(cfg, chooseGeometry(cfg.cellPx));
+  const D = carrierCapacity(cfg) - GT_HEADER;
+  if (D < 1) {
+    err.textContent = cfg.mode === "qr"
+      ? "QR version " + cfg.version + " is too small for the frame header; use version 2 or higher."
+      : "The window is too small for a raster. Enlarge it, or set fewer pixels per cell.";
+    return;
+  }
   showBtn.disabled = true;
   try {
     const url = name.split("/").map(encodeURIComponent).join("/");
@@ -1108,7 +1228,7 @@ async function loadFile(name) {
     } else {
       buf = new Uint8Array(await res.arrayBuffer());
     }
-    startQrMode(name, buf, version, eclOrd, px, D);
+    startSending(name, buf, cfg, D);
   } catch (e) {
     err.textContent = "Fetch failed: " + (e && e.message ? e.message : e);
   } finally {
@@ -1119,12 +1239,16 @@ showBtn.addEventListener("click", () => loadFile(fname.value));
 fname.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); loadFile(fname.value); } });
 
 /* ---------- QR mode ---------- */
-function startQrMode(name, buf, version, eclOrd, px, D) {
+function startSending(name, buf, cfg, D) {
   const size = buf.length, total = Math.ceil(size / D);
-  state = { name, size, total, D, version, eclOrd, px, buf, fileId: fileIdOf(name, size), digest: null,
-            cache: new Map(), pending: new Set(), current: 0, endBits: null, workers: [], rr: 0, url: null, n: 0 };
+  const big = cfg.mode === "raster";
+  state = { name, size, total, D, cfg, buf, fileId: fileIdOf(name, size), digest: null,
+            cache: new Map(), pending: new Set(), current: 0, endCode: null, workers: [], rr: 0, url: null, n: 0,
+            lookahead: big ? 4 : 64, cacheMax: big ? 8 : 128 };
   entry.classList.add("hidden"); qrmode.classList.remove("hidden");
-  meta.textContent = name + " · " + fmtBytes(size) + " · " + total + " chunks × " + D + " B · v" + version + "-" + "LMQH"[eclOrd];
+  meta.textContent = name + " · " + fmtBytes(size) + " · " + total + " chunk" + (total === 1 ? "" : "s") + " × " + fmtBytes(D)
+    + (cfg.mode === "qr" ? " · QR v" + cfg.version + "-" + "LMQH"[cfg.eclOrd]
+                         : " · raster " + cfg.cols + "x" + cfg.rows + " cells at " + cfg.cellPx + " px");
   saveBtn.classList.toggle("hidden", !DEBUG);
   setupCanvas();
   spawnWorkers(buf);
@@ -1138,7 +1262,7 @@ function spawnWorkers(buf) {
   if (buf.length > (256 << 20)) n = 1; else if (buf.length > (64 << 20)) n = Math.min(n, 2);
   const src = $("qrlib").textContent + "\n" + $("shared").textContent + "\n" + $("workersrc").textContent;
   state.url = URL.createObjectURL(new Blob([src], { type: "text/javascript" }));
-  const base = { type: "init", D: state.D, fileId: state.fileId, total: state.total, version: state.version, eclOrd: state.eclOrd };
+  const base = { type: "init", D: state.D, fileId: state.fileId, total: state.total, cfg: state.cfg };
   for (let k = 0; k < n; k++) {
     const w = new Worker(state.url);
     w.onmessage = onWorkerMsg;
@@ -1152,9 +1276,9 @@ function onWorkerMsg(e) {
   if (!state) return;
   const m = e.data;
   lastMsg = m.type + (m.i !== undefined ? "#" + m.i : "");
-  if (m.type === "bits") {
-    state.pending.delete(m.i); cachePut(m.i, m.bits);
-    if (m.i === state.current) render(m.bits);
+  if (m.type === "code") {
+    state.pending.delete(m.i); cachePut(m.i, m.code);
+    if (m.i === state.current) render(m.code);
   } else if (m.type === "digest") {
     state.digest = { crc: m.crc, sha: m.sha };
     if (state.current === state.total) show(state.total);
@@ -1165,7 +1289,7 @@ function onWorkerMsg(e) {
 }
 function cachePut(i, bits) {
   const c = state.cache; if (c.has(i)) c.delete(i); c.set(i, bits);
-  while (c.size > CACHE_MAX) c.delete(c.keys().next().value);
+  while (c.size > state.cacheMax) c.delete(c.keys().next().value);
 }
 function cacheGet(i) {
   const c = state.cache, b = c.get(i); if (b) { c.delete(i); c.set(i, b); } return b;
@@ -1181,31 +1305,59 @@ function requestFrames(from, to) {
 }
 
 function setupCanvas() {
-  const dpr = window.devicePixelRatio || 1;
-  const n = state.version * 4 + 17 + 2 * QUIET;
-  const m = Math.max(1, Math.round(state.px * dpr));       // integer device pixels per module
-  const dev = n * m;
-  canvas.width = dev; canvas.height = dev;
-  canvas.style.width = (dev / dpr) + "px"; canvas.style.height = (dev / dpr) + "px";
-  panel.style.left = (dev / dpr + 12) + "px";
-  offc = document.createElement("canvas"); offc.width = n; offc.height = n; offctx = offc.getContext("2d");
-  state.n = n;
+  const dpr = window.devicePixelRatio || 1, cfg = state.cfg;
+  let devW, devH, offW, offH;
+  if (cfg.mode === "qr") {
+    offW = offH = cfg.version * 4 + 17 + 2 * QUIET;
+    const m = Math.max(1, Math.round(cfg.cellPx * dpr));   // integer device pixels per module
+    devW = devH = offW * m;
+    state.n = offW;
+  } else {
+    offW = cfg.cols + 2 * R_EDGE; offH = cfg.rows + 2 * R_EDGE;
+    devW = offW * cfg.cellPx; devH = offH * cfg.cellPx;
+  }
+  canvas.width = devW; canvas.height = devH;
+  canvas.style.width = (devW / dpr) + "px"; canvas.style.height = (devH / dpr) + "px";
+  offc = document.createElement("canvas"); offc.width = offW; offc.height = offH;
+  offctx = offc.getContext("2d", { willReadFrequently: false });
   clearCanvas();
 }
 function clearCanvas() {
   const ctx = canvas.getContext("2d"); ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
 }
-function render(bits) {
-  const n = state.n, s = state.version * 4 + 17;
+function render(code) {
+  if (state.cfg.mode === "qr") renderQr(code); else renderRaster(code);
+  const ctx = canvas.getContext("2d");
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(offc, 0, 0, canvas.width, canvas.height);
+}
+
+function renderQr(bits) {
+  const n = state.n, s = state.cfg.version * 4 + 17;
   const img = offctx.createImageData(n, n), u32 = new Uint32Array(img.data.buffer);
-  u32.fill(0xFFFFFFFF);
+  u32.fill(WHITE32);
   for (let y = 0; y < s; y++) {
     const rowBase = (y + QUIET) * n + QUIET, bitBase = y * s;
-    for (let x = 0; x < s; x++) { const b = bitBase + x; if (bits[b >> 3] & (1 << (b & 7))) u32[rowBase + x] = 0xFF000000; }
+    for (let x = 0; x < s; x++) { const b = bitBase + x; if (bits[b >> 3] & (1 << (b & 7))) u32[rowBase + x] = BLACK32; }
   }
   offctx.putImageData(img, 0, 0);
-  const ctx = canvas.getContext("2d"); ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(offc, 0, 0, canvas.width, canvas.height);
+}
+
+/** White quiet zone, grey rim to locate the grid, then one colour per cell. */
+function renderRaster(cells) {
+  const cfg = state.cfg, w = cfg.cols + 2 * R_EDGE, h = cfg.rows + 2 * R_EDGE;
+  const img = offctx.createImageData(w, h), u32 = new Uint32Array(img.data.buffer);
+  u32.fill(WHITE32);
+  for (let y = R_QUIET; y < h - R_QUIET; y++) {
+    const row = y * w, left = row + R_QUIET, right = row + w - R_QUIET;
+    if (y < R_QUIET + R_RIM || y >= h - R_QUIET - R_RIM) u32.fill(GREY32, left, right);
+    else { u32.fill(GREY32, left, left + R_RIM); u32.fill(GREY32, right - R_RIM, right); }
+  }
+  for (let r = 0; r < cfg.rows; r++) {
+    const out = (r + R_EDGE) * w + R_EDGE, src = r * cfg.cols;
+    for (let c = 0; c < cfg.cols; c++) u32[out + c] = PAL32[cells[src + c]];
+  }
+  offctx.putImageData(img, 0, 0);
 }
 
 function show(i) {
@@ -1216,17 +1368,18 @@ function show(i) {
   if (i === state.total) {
     document.title = "GT END"; lbl.textContent = "END (" + state.total + " chunks)";
     if (state.digest === null) { clearCanvas(); lbl.textContent += " – computing checksums…"; return; }
-    if (!state.endBits) state.endBits = encodeFrame(buildEndFrame(state.size, state.digest.crc, state.digest.sha, state.name, state.fileId, state.total, state.D), state.version, GT_ECLS[state.eclOrd]);
-    render(state.endBits);
+    if (!state.endCode) state.endCode = encodeCarrier(state.cfg,
+      buildEndFrame(state.size, state.digest.crc, state.digest.sha, state.name, state.fileId, state.total, state.D));
+    render(state.endCode);
     return;
   }
   const pct = state.total > 0 ? Math.round(100 * i / state.total) : 100;
   document.title = "GT " + pct + "% " + i + "/" + state.total;
   lbl.textContent = "chunk " + i + " / " + state.total + "  (" + pct + "%)";
   let b = cacheGet(i);
-  if (!b) { b = encodeFrame(buildDataFrame(state.buf, i, state.D, state.fileId, state.total), state.version, GT_ECLS[state.eclOrd]); cachePut(i, b); }
-  render(b);                                                       // a QR is always on screen after a key
-  requestFrames(i + 1, i + LOOKAHEAD);
+  if (!b) { b = encodeCarrier(state.cfg, buildDataFrame(state.buf, i, state.D, state.fileId, state.total)); cachePut(i, b); }
+  render(b);                                                       // a code is always on screen after a key
+  requestFrames(i + 1, i + state.lookahead);
   dbg();
 }
 
@@ -1275,11 +1428,12 @@ backBtn.addEventListener("click", back);
 saveBtn.addEventListener("click", () => {
   if (!state) return;
   canvas.toBlob((b) => { const a = document.createElement("a"); a.href = URL.createObjectURL(b);
-    a.download = "gt_v" + state.version + "LMQH"[state.eclOrd] + "_" + (state.current === state.total ? "END" : state.current) + ".png";
+    a.download = "gt_" + state.cfg.mode + "_" + (state.current === state.total ? "END" : state.current) + ".png";
     a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 5000); }, "image/png");
 });
 
 /* ---------- URL parameters: ?file=name&px=4&ver=40&ecc=L&debug=1 ---------- */
+if (params.get("mode")) $("mode").value = params.get("mode");
 if (params.get("px")) $("px").value = params.get("px");
 if (params.get("ver")) $("ver").value = params.get("ver");
 if (params.get("ecc")) $("ecc").value = params.get("ecc").toUpperCase();
