@@ -1709,30 +1709,175 @@ public final class GlassReceiver {
             return Arrays.copyOfRange(body, 4, 4 + len);
         }
 
+        /**
+         * The runner-up reading of every group of cells: the byte pair that comes out if the one
+         * cell in the group that was the closest call is read as whatever it nearly was instead,
+         * and how close that call was.
+         *
+         * Seven cells carry two bytes, so a single misread cell costs a block two of its parity
+         * bytes, and a block that runs out of parity has usually just had a couple of borderline
+         * cells fall the wrong way. They can be picked out: on a compressed capture, 86 per cent of
+         * the bytes Reed-Solomon had to correct belonged to the most doubtful tenth of their block.
+         *
+         * Building this means a second pass over the image, so it is only done for a frame that has
+         * already failed to come out whole.
+         */
+        record SecondGuess(long[] margin, byte[] hi, byte[] lo, int[] budget) { }
+
+        static SecondGuess secondGuess(Img img, Geom g, Levels lv, byte[] cells) {
+            int cols = g.cols(), at = cols * CAL_ROWS, groups = dataCells(cols, g.rows()) / GROUP;
+            long[] margin = new long[groups];
+            byte[] hi = new byte[groups], lo = new byte[groups];
+            for (int gi = 0; gi < groups; gi++) {
+                int doubtful = 0, instead = 0;
+                long closest = Long.MAX_VALUE;
+                for (int k = 0; k < GROUP; k++) {
+                    int cell = gi * GROUP + k;
+                    int m = cellMean(img, g, cell % cols, cell / cols + CAL_ROWS);
+                    int r = (m >>> 16) & 255, gr = (m >>> 8) & 255, b = m & 255;
+                    long d1 = Long.MAX_VALUE, d2 = Long.MAX_VALUE;
+                    int s1 = 0, s2 = 0;
+                    for (int sym = 0; sym < SYMS; sym++) {
+                        long d = lv.distance(sym, r, gr, b, 1);
+                        if (d < d1) { d2 = d1; s2 = s1; d1 = d; s1 = sym; }
+                        else if (d < d2) { d2 = d; s2 = sym; }
+                    }
+                    if (d2 - d1 >= closest) continue;
+                    closest = d2 - d1;
+                    doubtful = k;
+                    instead = s1 != (cells[at + cell] & 0xFF) ? s1 : s2;   // the colour it nearly was
+                }
+                int v = 0;
+                for (int k = 0; k < GROUP; k++)
+                    v = v * SYMS + (k == doubtful ? instead : cells[at + gi * GROUP + k] & 0xFF);
+                margin[gi] = closest;
+                hi[gi] = (byte) (v >>> 8);
+                lo[gi] = (byte) v;
+            }
+            return new SecondGuess(margin, hi, lo, new int[] {PASS_BUDGET});
+        }
+
+        /**
+         * How a block that will not correct is searched. Each row is {flips, candidates}: every way
+         * of reading that many of the block's most doubtful groups the other way, drawn from that
+         * many of the most doubtful. One flip rescues a block that is a single cell over its
+         * parity; a noisier block needs several flipped together, and flipping them all at once
+         * flips the innocent ones too, so it has to be tried as combinations. Wider and deeper
+         * rows cost more, which is why they come last.
+         */
+        static final int[][] SEARCH = {{1, 24}, {2, 20}, {3, 16}, {4, 12}};
+
+        /** Reed-Solomon passes one frame may spend on all its failing blocks together. */
+        static final int PASS_BUDGET = 6000;
+
+        /**
+         * More failing blocks than this is not noise but a torn or covered frame, which no amount of
+         * guessing repairs, and the next capture will be fine. Better to give up quickly.
+         */
+        static final int MAX_SECOND_BLOCKS = 6;
+
+        /** Puts one group's other reading into a trial copy of a block. */
+        static void flip(int[] trial, int gi, int first, int last, SecondGuess sg) {
+            int p = gi * GROUP_BYTES;
+            if (p >= first && p <= last) trial[p - first] = sg.hi()[gi] & 0xFF;
+            if (p + 1 >= first && p + 1 <= last) trial[p + 1 - first] = sg.lo()[gi] & 0xFF;
+        }
+
+        /**
+         * Tries a block again with some of its doubtful groups read the other way, fewest flips
+         * first. Each attempt is a single Reed-Solomon pass, and Reed-Solomon checks its own work, so
+         * a block that comes back clean has been repaired, not merely made to look repaired. The
+         * frame's CRC is the final check on all of it.
+         */
+        static int secondLook(int[] blk, int block, int dpb, Layout L, SecondGuess sg) {
+            int first = block * dpb, last = first + dpb - 1;
+            int g0 = first / GROUP_BYTES, g1 = Math.min(last / GROUP_BYTES, sg.margin().length - 1);
+            if (g1 < g0) return -1;
+            Integer[] order = new Integer[g1 - g0 + 1];
+            for (int i = 0; i < order.length; i++) order[i] = g0 + i;
+            java.util.Arrays.sort(order, (x, y) -> Long.compare(sg.margin()[x], sg.margin()[y]));
+            int[] trial = new int[blk.length];
+            for (int[] row : SEARCH) {
+                int depth = row[0], k = Math.min(row[1], order.length);
+                if (k < depth) continue;
+                int[] idx = new int[depth];
+                for (int i = 0; i < depth; i++) idx[i] = i;
+                while (true) {
+                    if (sg.budget()[0]-- <= 0) return -1;
+                    System.arraycopy(blk, 0, trial, 0, blk.length);
+                    for (int d = 0; d < depth; d++) flip(trial, order[idx[d]], first, last, sg);
+                    try {
+                        int fixed = RS.correct(trial, L.ecc());
+                        System.arraycopy(trial, 0, blk, 0, blk.length);
+                        say(String.format("block %d: %d doubtful group(s) read the other way, then %d byte(s) corrected",
+                            block, depth, fixed));
+                        return fixed;
+                    } catch (IllegalStateException e) {
+                        // not those cells; next combination
+                    }
+                    int i = depth - 1;                              // advance to the next combination
+                    while (i >= 0 && idx[i] == k - depth + i) i--;
+                    if (i < 0) break;
+                    idx[i]++;
+                    for (int j = i + 1; j < depth; j++) idx[j] = idx[j - 1] + 1;
+                }
+            }
+            return -1;
+        }
+
         /** Reed-Solomon over every block; returns the number of repaired bytes, or -1 if beyond repair. */
-        static int repair(byte[] body, Layout L) {
-            int dpb = L.blockTotal() - L.ecc(), corrected = 0, failed = 0, firstFail = -1, lastFail = -1;
+        static int repair(byte[] body, Layout L) { return repair(body, L, null); }
+
+        static int repair(byte[] body, Layout L, SecondGuess sg) {
+            int dpb = L.blockTotal() - L.ecc(), corrected = 0;
             int[] blk = new int[L.blockTotal()];
-            for (int i = 0; i < L.blocks(); i++) {
-                for (int j = 0; j < dpb; j++) blk[j] = body[i * dpb + j] & 0xFF;
-                for (int j = 0; j < L.ecc(); j++) blk[dpb + j] = body[L.dataLen() + i * L.ecc() + j] & 0xFF;
+            List<Integer> failed = new ArrayList<>();
+            for (int i = 0; i < L.blocks(); i++) {                      // the plain pass over every block
+                load(body, L, i, dpb, blk);
                 try { corrected += RS.correct(blk, L.ecc()); }
                 catch (IllegalStateException e) {
-                    if (!DEBUG) return -1;
-                    failed++;
-                    if (firstFail < 0) firstFail = i;
-                    lastFail = i;
+                    failed.add(i);
+                    // Without a second guess to try, or with too many to be noise, one is enough to know.
+                    if (!DEBUG && (sg == null || failed.size() > MAX_SECOND_BLOCKS)) return -1;
                     continue;
                 }
-                for (int j = 0; j < dpb; j++) body[i * dpb + j] = (byte) blk[j];
+                store(body, i, dpb, blk);
             }
-            if (failed > 0) {
-                say(String.format("%d of %d blocks beyond repair (blocks %d..%d), %d bytes fixed elsewhere;"
-                    + " each block holds %d bytes and can fix %d",
-                    failed, L.blocks(), firstFail, lastFail, corrected, L.blockTotal(), L.ecc() / 2));
+            if (failed.isEmpty()) return corrected;
+
+            boolean look = sg != null && failed.size() <= MAX_SECOND_BLOCKS;
+            int rescued = 0;
+            List<Integer> lost = new ArrayList<>();
+            for (int i : failed) {
+                int fixed = -1;
+                if (look) {
+                    load(body, L, i, dpb, blk);                         // RS may have scribbled on it
+                    fixed = secondLook(blk, i, dpb, L, sg);
+                }
+                if (fixed < 0) { lost.add(i); continue; }
+                store(body, i, dpb, blk);
+                corrected += fixed;
+                rescued++;
+            }
+            if (rescued > 0) say(rescued + " of " + failed.size() + " failing block(s) rescued by a second look");
+            if (!lost.isEmpty()) {
+                say(String.format("%d of %d blocks beyond repair (%s), %d bytes fixed elsewhere;"
+                    + " each block holds %d bytes and can fix %d%s",
+                    lost.size(), L.blocks(), lost.size() > 8 ? "first " + lost.get(0) : lost.toString(), corrected,
+                    L.blockTotal(), L.ecc() / 2,
+                    look && sg.budget()[0] <= 0 ? "; the search budget ran out" : ""));
                 return -1;
             }
             return corrected;
+        }
+
+        static void load(byte[] body, Layout L, int i, int dpb, int[] blk) {
+            for (int j = 0; j < dpb; j++) blk[j] = body[i * dpb + j] & 0xFF;
+            for (int j = 0; j < L.ecc(); j++) blk[dpb + j] = body[L.dataLen() + i * L.ecc() + j] & 0xFF;
+        }
+
+        static void store(byte[] body, int i, int dpb, int[] blk) {
+            for (int j = 0; j < dpb; j++) body[i * dpb + j] = (byte) blk[j];
         }
 
         /** Diagnostic: do the error-correction bytes in this image agree with its data bytes? */
@@ -1743,7 +1888,11 @@ public final class GlassReceiver {
             if (lv == null) return -2;
             byte[] cells = readCells(img, r.geo, lv);
             byte[] body = cellsToBody(cells, r.geo.cols(), r.geo.rows());
-            return repair(body, layout(r.geo.cols(), r.geo.rows()));
+            Layout L = layout(r.geo.cols(), r.geo.rows());
+            int fixed = repair(body, L);
+            if (fixed >= 0) return fixed;
+            body = cellsToBody(cells, r.geo.cols(), r.geo.rows());   // as the decoder does, second look
+            return repair(body, L, secondGuess(img, r.geo, lv, cells));
         }
 
         // ---- carrier ---------------------------------------------------------------------
@@ -1805,6 +1954,10 @@ public final class GlassReceiver {
                     String.format("%dx%d cells, %d px, no repair", g.cols(), g.rows(), g.cellPx()), bounds);
 
             int corrected = repair(body, L);                            // something was misread
+            if (corrected < 0) {                                        // a block ran out of parity
+                body = cellsToBody(cells, g.cols(), g.rows());           // start over from the cells
+                corrected = repair(body, L, secondGuess(img, g, lv, cells));
+            }
             if (corrected >= 0) {
                 frame = frameOf(body, L);
                 if (frame != null && Protocol.parse(frame) != null)
@@ -1846,9 +1999,10 @@ public final class GlassReceiver {
         int fileId, total, chunkSize;
         boolean[] have, dropped;
         int haveCount, lowest, resumeCount, dropCount;
-        long chunksDone, startAt, lastKeyAt;
+        long chunksDone, startAt, lastKeyAt, firstKeyAt, answerNs, lastProgressAt;
+        boolean warnedKeys, outstanding;
         boolean retried, lastSeekTyped;
-        int keyActions, seeks, typedSeekFails, lastSeekTarget, sinceMapWrite;
+        int seeks, typedSeekFails, lastSeekTarget, sinceMapWrite, steppedSeeks, resends;
         FileChannel ch;
         Path part, map;
 
@@ -1931,7 +2085,8 @@ public final class GlassReceiver {
             have = new boolean[Math.max(total, 0)];
             dropped = new boolean[Math.max(total, 0)];
             haveCount = 0; lowest = 0; chunksDone = 0; sinceMapWrite = 0;
-            keyActions = 0; seeks = 0; typedSeekFails = 0; retried = false; lastSeekTyped = false;
+            seeks = 0; typedSeekFails = 0; retried = false; lastSeekTyped = false;
+            steppedSeeks = 0; resends = 0; answerNs = 0; warnedKeys = false; outstanding = false;
             Files.createDirectories(cfg.outDir);
             part = cfg.outDir.resolve(String.format("%08x.part", fileId));
             map = cfg.outDir.resolve(String.format("%08x.map", fileId));
@@ -1940,7 +2095,7 @@ public final class GlassReceiver {
             ch = FileChannel.open(part, StandardOpenOption.CREATE, StandardOpenOption.READ, StandardOpenOption.WRITE);
             if (haveCount == 0) ch.truncate(0);
             state = State.TRANSFERRING;
-            startAt = now; lastValidAt = now; lastKeyAt = now;
+            startAt = now; lastValidAt = now; lastKeyAt = now; lastProgressAt = now;
             log(String.format("Transfer started: fileId %08x, %d chunks of %d bytes, %s", fileId, total, chunkSize,
                 haveCount > 0 ? "resuming with " + haveCount + " of " + total + " chunks already received" : "from chunk 0"));
             onFrame(f, now);
@@ -2003,15 +2158,70 @@ public final class GlassReceiver {
             onFrame(f, now);
         }
 
+        /**
+         * A frame arrived, so the browser is listening. How long it took is worth remembering: the
+         * measure rises to any slow frame at once and comes down gently, so the receiver keeps to
+         * the slowest pace the client has actually shown rather than to a number picked here.
+         */
+        void noteAnswer(long now) {
+            lastProgressAt = now;
+            boolean alone = resends == 0;                            // one key produced this frame
+            resends = 0;
+            if (warnedKeys) { log("The browser is answering again"); warnedKeys = false; }
+            if (!outstanding) return;                                // nothing was waiting on a key
+            outstanding = false;
+            answerNs = paceAfter(answerNs, now - firstKeyAt, alone);
+        }
+
+        /**
+         * How the measure of a client's pace moves when a frame took this long. It rises to a slow
+         * frame at once and comes down only in eighths, and only when that frame answered a single
+         * key: a frame that arrived while several keys were queued says nothing about how long one
+         * of them takes, and believing it is what makes a receiver outrun a slow browser.
+         */
+        static long paceAfter(long answerNs, long took, boolean alone) {
+            if (took <= 0 || took > 30_000_000_000L) return answerNs;
+            if (took > answerNs) return took;
+            return alone ? (answerNs * 7 + took) / 8 : answerNs;
+        }
+
+        /** How long to wait for a frame before treating the key as missed rather than slow. */
+        static long patienceFor(long answerNs) {
+            if (answerNs == 0) return 2_000_000_000L;                // nothing measured yet
+            return Math.max(400_000_000L, Math.min(15_000_000_000L, answerNs * 4));
+        }
+
+        /** Deaf, as opposed to slow: quiet for far longer than it ever takes, over several keys. */
+        static boolean deafFor(long answerNs, int resends, long sinceProgressNs) {
+            return resends >= 3 && sinceProgressNs > Math.max(4_000_000_000L, answerNs * 6);
+        }
+
+        /** Notes a key going out. The oldest one still unanswered is the one being timed. */
+        void keySent(long now) {
+            if (!outstanding) { firstKeyAt = now; outstanding = true; }
+            lastKeyAt = now;
+        }
+
+        /**
+         * Four times what this client has been taking: a client that needs two seconds a frame is
+         * answering, not deaf, and sending it another key only makes it skip one.
+         */
+        long patience() { return patienceFor(answerNs); }
+
         void onFrame(Protocol.Frame f, long now) throws IOException {
+            noteAnswer(now);
             if (f.fileId() != fileId) {
                 log(String.format("A different file (id %08x) is shown; stopping this transfer, %s is kept for resume", f.fileId(), part.getFileName()));
                 abort();
                 return;
             }
             if (lastSeekTyped) {
-                if (f.index() != lastSeekTarget) typedSeekFails++; else typedSeekFails = 0;
-                lastSeekTyped = false;
+                if (f.index() != lastSeekTarget) typedSeekMissed("chunk " + f.index() + " came up instead");
+                else {
+                    if (typedSeekFails >= 2) log("The chunk field is taking numbers again");
+                    typedSeekFails = 0;
+                    lastSeekTyped = false;
+                }
             }
             if (f.type() == Protocol.DATA) {
                 store(f, now);
@@ -2044,15 +2254,13 @@ public final class GlassReceiver {
             have[i] = true;
             haveCount++;
             chunksDone++;
-            keyActions = 0;
             if (++sinceMapWrite >= 100) { saveMap(); sinceMapWrite = 0; }
             report(now);
         }
 
         /** Asks the sender for the next chunk we need, stepping when it is simply the next one. */
         void drive(int shown, long now) {
-            keyActions++;
-            lastKeyAt = now;
+            keySent(now);
             int target = nextNeeded(shown);
             if (target < 0) { seekTo(shown, total, now); return; }   // complete: go to the END code
             if (target < shown || shown >= total) {                  // going back for something missed
@@ -2065,25 +2273,47 @@ public final class GlassReceiver {
             seekTo(shown, target, now);
         }
 
+        /**
+         * Asks for one particular chunk by typing its number into the sender's chunk field and
+         * pressing Enter. Every request for a chunk that is not simply the next one goes this way,
+         * however near it is: two presses of Down are no more reliable than the number itself, and
+         * the number says what is wanted rather than describing the way to it.
+         *
+         * Stepping is kept for the case where the digits are not arriving -- a keyboard layout that
+         * puts something else on the number row, say. The sender's field is checked against what was
+         * asked for on the very next frame, and after two misses the receiver steps instead. It goes
+         * back to typing every fourth stepped seek, so one bad seek cannot stop it asking by number
+         * for the rest of the transfer.
+         */
+        /**
+         * A number was typed into the chunk field and the chunk asked for did not come up -- either
+         * something else did, or nothing did at all. Two of those in a row and the receiver stops
+         * trusting the digits and steps with the arrow keys instead.
+         */
+        void typedSeekMissed(String why) {
+            lastSeekTyped = false;
+            if (++typedSeekFails == 2)
+                log("The chunk field is not taking the numbers typed into it (asked for "
+                    + lastSeekTarget + ", " + why + "); stepping with the arrow keys instead");
+        }
+
         void seekTo(int shown, int target, long now) {
             int diff = target - shown;
             if (diff == 0) return;
             seeks++;
-            if (Math.abs(diff) <= 3 || typedSeekFails >= 2) {
-                int steps = Math.min(Math.abs(diff), 20);
-                for (int k = 0; k < steps; k++) {
-                    if (diff > 0) keys.up(); else keys.down();
-                    if (k < steps - 1) LockSupport.parkNanos(30_000_000L);
-                }
-                lastSeekTyped = false;
-            } else {
-                keys.typeDigits(target);
-                keys.enter();
+            if (typedSeekFails < 2) {
+                keys.typeDigits(target);                          // the field is selected, so this
+                keys.enter();                                     // replaces whatever it held
                 lastSeekTyped = true;
                 lastSeekTarget = target;
+                if (cfg.verbose) log("seek: asked for chunk " + target + " by number (showing " + shown + ")");
+            } else {
+                if (diff > 0) keys.up(); else keys.down();         // one step per frame, so that a
+                lastSeekTyped = false;                            // slow client is never outrun
+                if (++steppedSeeks % 4 == 0) typedSeekFails = 0;   // see whether digits work again
+                if (cfg.verbose) log("seek: stepped one towards " + target + " (showing " + shown + ")");
             }
-            lastKeyAt = now;
-            if (cfg.verbose) log("seek: shown " + shown + " -> " + target);
+            keySent(now);
         }
 
         void report(long now) {
@@ -2091,21 +2321,38 @@ public final class GlassReceiver {
             double kbps = chunksDone * (double) chunkSize / 1024.0 / secs;
             int pct = percent();
             int missing = total - haveCount;
-            ui(GREEN, String.format("%d%%   chunk %d / %d   %.1f KB/s", pct, haveCount, total, kbps));
+            ui(GREEN, String.format("%d%%   chunk %d / %d   %.1f KB/s%s", pct, haveCount, total, kbps, pace()));
             setTitle(String.format("GlassTransfer %d%% - %d/%d chunks", pct, haveCount, total));
             if (chunksDone % 100 == 0 || haveCount == total) {
                 String s = String.format("%d%%  %d/%d chunks  %.1f chunks/s  %.1f KB/s", pct, haveCount, total, chunksDone / secs, kbps);
                 if (missing > 0 && haveCount + missing == total && lowest < total && !have[lowest]) s += "  (" + missing + " still missing)";
+                s += pace();
                 if (cfg.stats) s += String.format("  capture %.1f ms  decode %.1f ms  polls %d", capNs / 1e6 / frames, decNs / 1e6 / frames, frames);
                 log(s);
             }
         }
 
+        /** Worth saying out loud only when the browser, rather than the screen, sets the pace. */
+        String pace() {
+            return answerNs > 500_000_000L ? String.format("  browser %.1f s a frame", answerNs / 1e9) : "";
+        }
+
         void idle(long now, Protocol.Frame f) throws IOException {
             if (f != null && f.fileId() == fileId) {
-                boolean stuck = keyActions >= 4;
-                if (stuck) ui(RED, "Browser not receiving keys - click the sender's chunk field");
-                if (now - lastKeyAt > (stuck ? 2_000_000_000L : 400_000_000L)) {
+                // Slow and deaf look the same for a moment. Only the browser that has gone quiet for
+                // far longer than it has ever taken to answer, across several keys, is called deaf.
+                boolean deaf = deafFor(answerNs, resends, now - lastProgressAt);
+                if (deaf) {
+                    ui(RED, "Browser not receiving keys - click the sender's chunk field");
+                    if (!warnedKeys) {
+                        warnedKeys = true;
+                        log(String.format("Nothing from the browser for %.1f s over %d key press(es);"
+                            + " click the sender's chunk field", (now - lastProgressAt) / 1e9, resends));
+                    }
+                }
+                if (now - lastKeyAt > (deaf ? Math.max(2_000_000_000L, patience()) : patience())) {
+                    if (lastSeekTyped) typedSeekMissed("nothing came up at all");
+                    resends++;
                     if (f.type() == Protocol.DATA) { store(f, now); drive(f.index(), now); }
                     else if (haveCount >= total) finish(f, now);
                     else drive(total, now);
@@ -2508,6 +2755,108 @@ public final class GlassReceiver {
                     "raster ignores a false rim below the code and finds the real one");
             }
 
+            // Cells that came out between two colours are what exhausts a block's parity, and the
+            // decoder is entitled to a second guess at them. Five such cells in one block is one
+            // more than its parity can carry, and each is only just on the wrong side.
+            {
+                int cols = 160, rows = 120, cellPx = 2;
+                byte[] chunk = new byte[Raster.frameCapacity(cols, rows) - Protocol.HEADER];
+                rnd.nextBytes(chunk);
+                byte[] frame = Protocol.build(Protocol.DATA, 11, 4, 6, chunk.length, chunk);
+                byte[] cells = Raster.encode(frame, cols, rows);
+                Img img = Raster.render(cells, cols, rows, cellPx);
+                int at = cols * Raster.CAL_ROWS;
+                for (int k = 0; k < 5; k++) {
+                    int cell = (3 + k * 6) * Raster.GROUP + 1;        // a high digit, so both bytes move
+                    int right = cells[at + cell] & 0xFF, wrong = (right + 1) % Raster.SYMS;
+                    smudge(img, cols, cellPx, cell, right, wrong);
+                }
+                Carrier.Out out = new Raster().read(img);
+                check(out.kind() == Kind.OK && Arrays.equals(out.bytes(), frame),
+                    "raster reads five borderline cells the other way rather than losing the frame");
+            }
+
+            // A browser that answers every key, slowly, must never be called deaf, and must never
+            // be sent a second key while the first is still being drawn. This is the whole of what
+            // separates a slow client from one that is not listening.
+            {
+                long fast = 70_000_000L, slow = 2_200_000_000L;
+                check(Transfer.patienceFor(0) >= 2_000_000_000L, "an unmeasured client is given at least 2 s");
+                check(Transfer.patienceFor(fast) == 400_000_000L, "a fast client keeps the 400 ms floor");
+                check(Transfer.patienceFor(slow) > slow * 3, "a slow client is waited for, not talked over");
+                check(Transfer.patienceFor(60_000_000_000L) == 15_000_000_000L, "patience is capped");
+
+                long pace = 0;                                    // a client that always takes 2.2 s
+                int hurried = 0, accused = 0;
+                for (int i = 0; i < 40; i++) {
+                    pace = Transfer.paceAfter(pace, slow, true);
+                    if (Transfer.patienceFor(pace) <= slow) hurried++;
+                    if (Transfer.deafFor(pace, 0, slow)) accused++;
+                }
+                check(hurried == 0, "a client taking 2.2 s a frame is never talked over, across 40 frames");
+                check(accused == 0, "a client taking 2.2 s a frame is never called deaf, across 40 frames");
+
+                // Frames that arrive with keys queued say nothing, and must not drag the measure down.
+                long kept = pace;
+                for (int i = 0; i < 20; i++) kept = Transfer.paceAfter(kept, 50_000_000L, false);
+                check(kept == pace, "a frame that answered a pile of keys does not count as quick");
+                long relaxed = pace;
+                for (int i = 0; i < 40; i++) relaxed = Transfer.paceAfter(relaxed, 50_000_000L, true);
+                check(relaxed < pace / 4, "a client that speeds up is believed, one clean frame at a time");
+
+                // And a browser that answers nothing at all still has to be reported.
+                check(Transfer.deafFor(pace, 3, 20_000_000_000L), "silence over several keys is deaf");
+                check(!Transfer.deafFor(pace, 1, 20_000_000_000L), "one unanswered key is not deaf");
+                check(Transfer.deafFor(0, 3, 5_000_000_000L), "silence from an unmeasured client is deaf");
+            }
+
+            // Six borderline cells in one block are twelve bad bytes against nine it can fix, and no
+            // single flip gets it under: two of the six must be read the other way together. This is
+            // the shape of a real capture that failed after the one-flip search had been added.
+            {
+                int cols = 160, rows = 120, cellPx = 2;
+                byte[] chunk = new byte[Raster.frameCapacity(cols, rows) - Protocol.HEADER];
+                rnd.nextBytes(chunk);
+                byte[] frame = Protocol.build(Protocol.DATA, 12, 5, 7, chunk.length, chunk);
+                byte[] cells = Raster.encode(frame, cols, rows);
+                Img img = Raster.render(cells, cols, rows, cellPx);
+                int at = cols * Raster.CAL_ROWS;
+                for (int k = 0; k < 6; k++) {
+                    int cell = (3 + k * 6) * Raster.GROUP;           // the leading digit: both bytes move
+                    int right = cells[at + cell] & 0xFF, wrong = (right + 1) % Raster.SYMS;
+                    smudge(img, cols, cellPx, cell, right, wrong);
+                }
+                Carrier.Out out = new Raster().read(img);
+                check(out.kind() == Kind.OK && Arrays.equals(out.bytes(), frame),
+                    "raster rescues a block with six borderline cells by flipping some of them together");
+            }
+
+            // A frame with a great many failing blocks is torn or covered, not noisy. It has to fail
+            // cleanly and promptly rather than burn its search budget on every block.
+            {
+                int cols = 160, rows = 120, cellPx = 2;
+                byte[] chunk = new byte[Raster.frameCapacity(cols, rows) - Protocol.HEADER];
+                rnd.nextBytes(chunk);
+                byte[] frame = Protocol.build(Protocol.DATA, 13, 6, 8, chunk.length, chunk);
+                byte[] cells = Raster.encode(frame, cols, rows);
+                Raster.Layout L = Raster.layout(cols, rows);
+                int dpb = L.blockTotal() - L.ecc();
+                Img img = Raster.render(cells, cols, rows, cellPx);
+                int at = cols * Raster.CAL_ROWS;
+                for (int b = 0; b < L.blocks(); b++)                 // a dozen borderline cells in every block
+                    for (int k = 0; k < 12; k++) {
+                        int cell = ((b * dpb / Raster.GROUP_BYTES) + 2 + k * 4) * Raster.GROUP;
+                        if (at + cell >= cells.length) continue;
+                        int right = cells[at + cell] & 0xFF;
+                        smudge(img, cols, cellPx, cell, right, (right + 1) % Raster.SYMS);
+                    }
+                long t0 = System.nanoTime();
+                Carrier.Out out = new Raster().read(img);
+                long ms = (System.nanoTime() - t0) / 1_000_000L;
+                check(out.kind() != Kind.OK, "raster reports failure rather than wrong data when every block is wrecked");
+                check(ms < 1500, "a wrecked frame is given up on promptly (" + ms + " ms)");
+            }
+
             // Nothing on screen, and a plain white field, must both read as "no code".
             {
                 Img blank = new Img(new int[300 * 200], 300, 200);
@@ -2575,6 +2924,20 @@ public final class GlassReceiver {
                 }
             }
             return new Img(px, src.w(), src.h());
+        }
+
+        /** Paints one data cell as a blend that lands just on the wrong side of the two colours. */
+        static void smudge(Img img, int cols, int cellPx, int dataCell, int right, int wrong) {
+            int edge = Raster.RIM + Raster.QUIET;
+            int col = dataCell % cols, row = dataCell / cols + Raster.CAL_ROWS;
+            int a = Raster.colourOf(right), b = Raster.colourOf(wrong), mix = 0;
+            for (int sh = 0; sh <= 16; sh += 8) {                     // 45 per cent of the true colour
+                int va = (a >>> sh) & 255, vb = (b >>> sh) & 255;
+                mix |= ((va * 45 + vb * 55) / 100) << sh;
+            }
+            for (int dy = 0; dy < cellPx; dy++)
+                for (int dx = 0; dx < cellPx; dx++)
+                    img.px()[((edge + row) * cellPx + dy) * img.w() + (edge + col) * cellPx + dx] = mix;
         }
 
         /** Renders the same image the way a poor display or a lossy path would hand it back. */

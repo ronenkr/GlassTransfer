@@ -67,6 +67,21 @@ that is interrupted leaves `<fileId>.part` and `<fileId>.map` behind; start the 
 it picks up exactly the chunks it lacks. If verification fails at the end it fetches the whole file
 once more before giving up.
 
+Going back for a chunk is done by name, not by navigation: the receiver types that chunk's number
+into the sender's chunk field and presses Enter, exactly as you would. Only the step to the next
+chunk uses a key of its own, the Up arrow, because that is the one the whole transfer rides on. If
+the number typed does not bring up the chunk that was asked for -- a keyboard layout with something
+other than digits on the number row, say -- the receiver says so and steps with the arrow keys
+instead, trying the field again every fourth seek in case it starts working.
+
+One key is in the air at a time. How long the browser takes to answer one is measured as the
+transfer runs, and the receiver waits four times that before it assumes a key went missing: a client
+that needs two seconds a frame is answering, not ignoring, and sending it another key only makes it
+skip a chunk and then need fetching back. The measure rises to a slow frame at once and comes down
+gently, and a frame that arrived while several keys were queued is not counted, since it says
+nothing about how long one key takes. When the browser is what sets the pace, the status line says
+so: `browser 1.4 s a frame`.
+
 ## Sender
 
 One self-contained file. Nayuki's QR Code generator (MIT) is vendored inside it; the pristine copy
@@ -182,6 +197,22 @@ cent, in blocks of at most 255 bytes. The parity is only touched when the frame'
 clean capture pays nothing for it. Isolated misread cells are repaired; a torn capture fails the
 CRC and the next capture succeeds.
 
+Because seven cells carry two bytes, one misread cell spends two of a block's parity bytes, and a
+block that runs out has usually just had a few borderline cells fall the wrong way. Those can be
+picked out: on a compressed capture, 86 per cent of the bytes the parity had to fix belonged to the
+most doubtful tenth of their block. So a block that will not correct is tried again with some of its
+closest calls read the other way.
+
+One flip rescues a block that is a single cell over its parity. A noisier one needs several flipped
+together, and flipping every doubtful cell at once flips the innocent ones too, so the second look
+searches combinations: every single flip among the 24 most doubtful groups, then every pair among
+20, every triple among 16, every quadruple among 12, fewest flips first. A real capture that needed
+three was found this way. Each attempt is one Reed-Solomon pass and Reed-Solomon checks its own
+work, with the frame's CRC as the final gate. The search spends a fixed budget of passes per frame
+-- about 80 ms at the very worst -- and is skipped altogether when more than six blocks fail, which
+is a torn or covered frame, not noise; those are given up on in a millisecond and the next capture
+is fine. A clean capture never takes a second look.
+
 ## Frame format
 
 Every code carries a 23-byte header and a payload, big-endian throughout.
@@ -234,8 +265,17 @@ measured rate lands within a few per cent either way.
 - **Every frame reports repairs.** The cells are being read marginally. Raise pixels per cell, or
   check that the browser is at 100 per cent zoom. Colour accuracy is not the issue: cells are read
   by which channel dominates, so any night-light, colour profile or brightness setting is fine.
+- **It says the browser is not receiving keys, but it is -- just slowly.** It should not: the
+  receiver paces itself to however long this client takes, and only reports keys as lost after
+  several in a row go unanswered for far longer than the browser has ever taken. If you do see it on
+  a browser that is merely slow, the status line's `browser N s a frame` figure says what pace it
+  thinks it is keeping.
 - **Keys are ignored no matter what.** A browser started as administrator will not accept synthetic
   keystrokes from a normal-privilege program. Run both at the same level.
+- **"The chunk field is not taking the numbers typed into it."** The digits are not reaching the
+  page. The transfer carries on by stepping with the arrow keys, which is slower but correct. It is
+  usually a keyboard layout that needs a modifier for the number row; switching the layout to one
+  with plain digits, or turning Num Lock on so the numeric keypad is used, fixes it.
 - **The page says it must be served over HTTP.** Browsers block `fetch` on `file://` URLs. Serve the
   folder with `jwebserver`.
 - **The checksum fails at the end.** The receiver restarts the file once by itself. If it fails
@@ -246,8 +286,15 @@ measured rate lands within a few per cent either way.
 `java desktop\GlassReceiver.java --selftest` runs offline: Reed-Solomon correction at and beyond its
 limit, the format and version BCH codes, the block tables for all 160 QR version and level
 combinations, 56 QR encode-render-decode round trips, and colour raster round trips from 64x40 up to
-585x630 cells including damage the parity has to repair. One case is drawn from a real capture that failed: a grey window edge below the code forms a second,
-larger rim, and the decoder has to work through to the real one. It also re-renders a raster the way
+585x630 cells including damage the parity has to repair. It also checks the rules that pace the sender: a client taking 2.2 seconds a frame must never be
+talked over nor called deaf, a client that has gone quiet over several keys must be, and a frame
+that arrived with keys queued behind it must not be mistaken for a quick one.
+
+Four cases are drawn from real captures that failed: a grey window edge below the code forming a
+second, larger rim that the decoder has to work past; five cells landing just on the wrong side of a
+colour boundary in one block, which is one more than its parity can carry; six, which no single flip
+rescues and only a combination does; and a frame with every block wrecked, which has to be refused
+at once rather than searched. It also re-renders a raster the way
 a poor display would hand it back -- dimmed to 45 per cent, contrast squeezed into 40..200, channels gained
 unevenly, noisy, and all of that at once -- and at 16, 8 and 4 bits of colour, dithered and not,
 requiring every one to decode byte for byte. A 3 bit render has to be refused rather than misread.
